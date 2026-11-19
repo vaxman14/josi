@@ -1,0 +1,41 @@
+import { posix, win32 } from 'node:path';
+
+/** Database records keep their portable /data/... names. Only filesystem
+ * boundaries translate those names into the native installation's data root.
+ * This is path translation, not authorization to read an arbitrary file.
+ */
+export function resolveDataPath(
+  path: string,
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  // The suite runs on machines with no writable /data; vitest.config.mts names
+  // a scratch root. NODE_ENV keeps a stray variable from moving a server's data.
+  if (env.NODE_ENV === 'test' && env.JOSI_TEST_DATA_DIR && (path === '/data' || path.startsWith('/data/'))) {
+    return (platform === 'win32' ? win32 : posix).join(env.JOSI_TEST_DATA_DIR, path.slice('/data'.length));
+  }
+  if (!['win32', 'darwin', 'linux'].includes(platform) || env.JOSI_NATIVE_RUNTIME !== '1') return path;
+  if (path !== '/data' && !path.startsWith('/data/')) return path;
+  const root = env.JOSI_DATA_DIR;
+  if (platform === 'darwin' || platform === 'linux') {
+    if (!root || !posix.isAbsolute(root) || root === '/' || posix.normalize(root) !== root
+      || /[\x00-\x1f]/.test(root) || root.endsWith('/')) {
+      throw new Error('Native data storage is not configured');
+    }
+    const segments = path.slice('/data'.length).split('/').filter(Boolean);
+    if (segments.some(part => part === '.' || part === '..' || /[\\\x00-\x1f]/.test(part))) {
+      throw new Error('Invalid native data path');
+    }
+    return posix.join(root, ...segments);
+  }
+  if (!root || !/^[A-Za-z]:[\\/]/.test(root) || root.includes('\0')) {
+    throw new Error('Native data storage is not configured');
+  }
+  const segments = path.slice('/data'.length).split('/').filter(Boolean);
+  if (segments.some((part) => part === '.' || part === '..'
+    || /[\\<>:"|?*\x00-\x1f]/.test(part) || /[. ]$/.test(part)
+    || /^(CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)/i.test(part))) {
+    throw new Error('Invalid native data path');
+  }
+  return win32.join(win32.resolve(root), ...segments);
+}

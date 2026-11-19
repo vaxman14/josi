@@ -1,0 +1,42 @@
+#!/bin/bash
+# The container's entrypoint. Says plainly which graphics devices reached the container (NVIDIA, AMD or Intel)
+# or that none did, hands the GPU settings given to the container to Ollama, then hands over to systemd, which
+# starts Ollama, warms the model once and then starts Josi (see the three units). If Ollama or Josi dies,
+# systemd exits and so does the container, so Docker restarts it.
+set -u
+echo "Josi all-in-one (Josi + Ollama + the Josi model)"
+
+# systemd does not pass the container's own environment on to the services it starts, so what Ollama needs to
+# know about graphics (for example OLLAMA_IGPU_ENABLE=1, HSA_OVERRIDE_GFX_VERSION, GGML_VK_VISIBLE_DEVICES)
+# is written to a file the Ollama unit reads. OLLAMA_HOST stays what the unit says.
+{ env | grep -E '^(OLLAMA_[A-Z_]+|GGML_VK_[A-Z_]+|HSA_[A-Z_]+|HIP_VISIBLE_DEVICES|ROCR_VISIBLE_DEVICES|CUDA_VISIBLE_DEVICES|GPU_DEVICE_ORDINAL)=' || true; } \
+  | grep -v -E '^(OLLAMA_HOST|OLLAMA_MODELS)=' > /etc/ollama-allinone.env 2>/dev/null || true
+
+found=0
+if command -v nvidia-smi >/dev/null 2>&1 && gpu=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null) && [ -n "$gpu" ]; then
+  echo "GPU: NVIDIA $(echo "$gpu" | head -n1)."
+  found=1
+fi
+# AMD and Intel cards reach the container as render nodes (and /dev/kfd for AMD's compute interface).
+for n in /sys/class/drm/renderD*; do
+  [ -e "$n" ] || continue
+  case "$(cat "$n/device/vendor" 2>/dev/null)" in
+    0x1002) v=AMD ;;
+    0x8086) v=Intel ;;
+    0x10de) v='' ;;   # an NVIDIA card is reported above
+    *) v='' ;;
+  esac
+  [ -n "$v" ] || continue
+  if [ -r "/dev/dri/$(basename "$n")" ] || [ -e "/dev/dri/$(basename "$n")" ]; then
+    echo "GPU: $v graphics device /dev/dri/$(basename "$n")."
+    found=1
+  fi
+done
+if [ "$found" = 1 ]; then
+  echo "Ollama chooses what it can use. A graphics chip built into the processor is left unused unless the container is run with -e OLLAMA_IGPU_ENABLE=1."
+  echo "The line 'The Josi model is loaded and running on ...' below says where the model really runs."
+else
+  echo "NO GPU passed to this container: the model will run on the CPU. Answers will be slow."
+  echo "(Give the container the card: NVIDIA --gpus all; AMD or Intel --device /dev/dri (and --device /dev/kfd for AMD). ./install.sh does it when it finds one.)"
+fi
+exec /sbin/init

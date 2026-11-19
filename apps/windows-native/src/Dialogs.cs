@@ -1,0 +1,624 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Security.AccessControl;
+using System.Security.Principal;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Threading;
+
+namespace Josi.Native {
+  /// Themed modal windows. Recovery dialogs cannot be dismissed until the user
+  /// confirms that the one-time material is saved.
+  public static class Dialogs {
+    static bool recoveryOpen;
+
+    public class Sheet : Window {
+      public bool Locked;
+      /// What this sheet is, for automation: josi.sheet.<Kind>, and the popup state while it is open.
+      public readonly string Kind;
+      public Sheet(Window owner, string title, double width, string kind = null) {
+        Kind = kind ?? Automation.Slug(title);
+        Automation.Id(this, "josi.sheet." + Kind, title);
+        Automation.BeginScope(Kind);
+        Loaded += delegate { Automation.Popup = Kind; };
+        Closed += delegate { if (Automation.Popup == Kind) Automation.Popup = "none"; };
+        Owner = owner; Title = title; Width = width; SizeToContent = SizeToContent.Height; MaxHeight = 760;
+        WindowStartupLocation = WindowStartupLocation.CenterOwner; ResizeMode = ResizeMode.NoResize; ShowInTaskbar = false;
+        Background = Ui.Sidebar; Foreground = Ui.Text; FontFamily = Ui.Font; FontSize = 14;
+        Resources.MergedDictionaries.Add(Ui.Resources);
+        KeyDown += (s, e) => { if (e.Key == Key.Escape && !Locked) Close(); };
+        SourceInitialized += delegate {
+          var handle = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+          // Protected approvals/recovery stay out of public capture APIs.
+          SetWindowDisplayAffinity(handle, 0x11);
+          var on = 1; NativeDark(handle, 20, ref on);
+          var caption = 0x00301E14; NativeDark(handle, 35, ref caption);
+        };
+      }
+      protected override void OnClosing(System.ComponentModel.CancelEventArgs e) { if (Locked) e.Cancel = true; base.OnClosing(e); }
+      public void Body(UIElement content) {
+        Content = new ScrollViewer { Content = content, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Padding = new Thickness(26), Focusable = false };
+      }
+    }
+    [System.Runtime.InteropServices.DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int size);
+    [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool SetWindowDisplayAffinity(IntPtr window, uint affinity);
+    static void NativeDark(IntPtr handle, int attribute, ref int value) { try { DwmSetWindowAttribute(handle, attribute, ref value, sizeof(int)); } catch (Exception) { } }
+
+    public static bool Confirm(Window owner, string title, string detail, string action) {
+      var sheet = new Sheet(owner, "Josi", 480, "confirm");
+      var result = false;
+      var go = Automation.Id(Ui.Pill(action, () => { result = true; sheet.Close(); }, true), "josi.confirm.ok");
+      var cancel = Automation.Id(Ui.Pill("Cancel", () => sheet.Close()), "josi.confirm.cancel");
+      cancel.IsCancel = true;
+      sheet.Closed += delegate { Automation.PopupResult = result ? "confirm:ok" : "confirm:cancelled"; };
+      sheet.Body(Ui.Stack(14, Ui.T(title, 17, FontWeights.SemiBold), detail == null ? null : Ui.Copyable(detail, 14, Ui.Muted),
+        Ui.Spread(null, Ui.Row(8, cancel, go))));
+      sheet.Loaded += delegate { cancel.Focus(); };
+      sheet.ShowDialog();
+      return result;
+    }
+    public static void Message(Window owner, string title, string detail) {
+      var sheet = new Sheet(owner, "Josi", 460, "message");
+      var ok = Automation.Id(Ui.Pill("OK", () => sheet.Close(), true), "josi.message.ok"); ok.IsDefault = true;
+      sheet.Closed += delegate { Automation.PopupResult = "message:ok"; };
+      sheet.Body(Ui.Stack(14, Ui.T(title, 17, FontWeights.SemiBold), Ui.Secondary(detail), Ui.Spread(null, ok)));
+      sheet.ShowDialog();
+    }
+    /// A settings change Josi prepared in conversation: what will change, in
+    /// the words the person will be held to, with Approve and Decline.
+    public static void SettingsChange(Window owner, AppModel model, Wire proposal) {
+      var sheet = new Sheet(owner, "Josi", 560, "settings-change");
+      var administrator = proposal["scope"].Text == "administrator";
+      var decision = "later";
+      var sensitive = proposal["sensitive"].Flag;
+      var password = Automation.Id(Ui.Secret("Your account password"), "josi.settings-change.password");
+      var problem = Automation.Id(Ui.T("", 13, null, Ui.Error), "josi.settings-change.error");
+      problem.Visibility = Visibility.Collapsed;
+      Button approve = null;
+      Action say = null;
+      approve = Automation.Id(Ui.Pill(administrator ? "Approve and Apply" : "Approve", async () => {
+        if (!sensitive) {
+          decision = "approved"; sheet.Close();
+          model.Run(async () => { var note = await model.DecideSettingsChange(proposal, true); if (note.Length > 0) Notifications.Show("Settings change", note); });
+          return;
+        }
+        // A sensitive change stays open until the server accepts the password.
+        var secret = password.Password;
+        if (secret.Length == 0) { problem.Text = "Enter your password to approve this."; say(); return; }
+        approve.IsEnabled = false;
+        try {
+          var note = await model.DecideSettingsChange(proposal, true, secret);
+          decision = "approved"; password.Clear(); sheet.Close();
+          if (note.Length > 0) Notifications.Show("Settings change", note);
+        } catch (JosiException e) {
+          password.Clear(); problem.Text = e.Message; say(); approve.IsEnabled = true; password.Focus();
+        }
+      }, true), "josi.settings-change.approve");
+      say = () => { problem.Visibility = Visibility.Visible; };
+      approve.IsDefault = sensitive;
+      var decline = Automation.Id(Ui.Pill("Decline", () => { decision = "declined"; sheet.Close(); model.Run(async () => { await model.DecideSettingsChange(proposal, false); }); }), "josi.settings-change.decline");
+      var later = Automation.Id(Ui.Pill("Decide Later", () => sheet.Close()), "josi.settings-change.later");
+      later.IsCancel = true;
+      sheet.Closed += delegate { Automation.PopupResult = "settings-change:" + decision; };
+      sheet.Body(Ui.Stack(14,
+        Ui.Row(10, Ui.JosiMark(28), Ui.T("Josi proposes a settings change", 17, FontWeights.SemiBold)),
+        Automation.Id(Ui.T(proposal["title"].Text, 15, FontWeights.SemiBold), "josi.settings-change.title"),
+        Automation.Id(Ui.Copyable(proposal["summary"].Text, 14), "josi.settings-change.summary"),
+        Ui.Caption((administrator ? "An administrator setting for this installation." : "Your own setting.")
+          + (sensitive ? " This is a sensitive change; the administrator is told by email when a member makes one." : "")
+          + " Nothing changes until you approve. You can also find it under Approvals."),
+        sensitive ? Ui.Field("Confirm your account password", password) : null,
+        sensitive ? problem : null,
+        Ui.Spread(later, Ui.Row(8, decline, approve))));
+      sheet.Loaded += delegate { if (sensitive) password.Focus(); else approve.Focus(); };
+      sheet.ShowDialog();
+    }
+    /// A credential card Josi asked for in conversation: the fields the
+    /// catalogue names, secure where the value is a secret. Save performs the
+    /// route with this person's own session; the typed values go nowhere else
+    /// and the conversation learns only that it was saved.
+    public static void CredentialCard(Window owner, AppModel model, Wire proposal) {
+      var card = proposal["card"];
+      var sheet = new Sheet(owner, "Josi", 560, "credential-card");
+      var outcome = "later";
+      var problem = Automation.Id(Ui.T("", 13, null, Ui.Error), "josi.credential-card.error");
+      problem.Visibility = Visibility.Collapsed;
+      var inputs = new List<Tuple<Wire, FrameworkElement>>();
+      var body = Ui.Stack(12); Grid.SetIsSharedSizeScope(body, true);
+      foreach (var field in card["fields"].List) {
+        var type = field["type"].Text; var label = field["label"].Text + (field["required"].Flag ? "" : " (optional)");
+        FrameworkElement control;
+        if (type == "secret") { var entry = Ui.SecretField(label); Automation.Id(entry.Hidden, "josi.credential-card.field." + field["key"].Text); control = entry; }
+        else if (type == "confirm") control = Ui.Toggle(field["label"].Text);
+        else control = Ui.Visible(Ui.Input(field["placeholder"].Text.Length > 0 ? field["placeholder"].Text : null));
+        if (type != "secret") Automation.Id(control, "josi.credential-card.field." + field["key"].Text);
+        inputs.Add(Tuple.Create(field, control));
+        body.Children.Add(type == "confirm" ? control : Ui.Stack(5, Ui.T(label, 13.5), type == "secret" ? control : Ui.PasteRow((TextBox)control, label)));
+      }
+      if (inputs.Count == 0) body.Children.Add(Ui.T("This card has nothing to fill in. Ask Josi to open it again.", 13, null, Ui.Error));
+      Button save = null;
+      save = Automation.Id(Ui.Pill("Save", async () => {
+        var values = new Dictionary<string, object>();
+        foreach (var pair in inputs) {
+          var field = pair.Item1; var key = field["key"].Text;
+          var secret = pair.Item2 as Ui.SecretEntry; var toggle = pair.Item2 as CheckBox; var text = pair.Item2 as TextBox;
+          if (secret != null) { var value = secret.Value.Trim(); if (value.Length == 0 && field["required"].Flag) { problem.Text = field["label"].Text + " is required."; problem.Visibility = Visibility.Visible; secret.Focus(); return; } values[key] = value; }
+          else if (toggle != null) { if (toggle.IsChecked != true && field["required"].Flag) { problem.Text = "Please confirm: " + field["label"].Text; problem.Visibility = Visibility.Visible; return; } values[key] = toggle.IsChecked == true; }
+          else if (text != null) { var typed = text.Text.Trim(); if (typed.Length == 0 && field["required"].Flag) { problem.Text = field["label"].Text + " is required."; problem.Visibility = Visibility.Visible; text.Focus(); return; } values[key] = typed; }
+        }
+        save.IsEnabled = false; problem.Visibility = Visibility.Collapsed;
+        try {
+          var note = await model.SaveCredentialCard(proposal, values);
+          outcome = "saved";
+          foreach (var pair in inputs) { var secret = pair.Item2 as Ui.SecretEntry; if (secret != null) secret.Clear(); }
+          sheet.Close();
+          if (note.Length > 0) Notifications.Show("Saved", note);
+        } catch (JosiException e) {
+          problem.Text = e.Message; problem.Visibility = Visibility.Visible; save.IsEnabled = true;
+          foreach (var pair in inputs) { var secret = pair.Item2 as Ui.SecretEntry; if (secret != null) secret.Clear(); }
+        }
+      }, true), "josi.credential-card.save");
+      save.IsDefault = true;
+      var cancel = Automation.Id(Ui.Pill("Not now", () => { outcome = "later"; sheet.Close(); }), "josi.credential-card.later");
+      cancel.IsCancel = true;
+      var decline = Automation.Id(Ui.Pill("Decline", () => { outcome = "declined"; sheet.Close(); model.Run(async () => { await model.DecideSettingsChange(proposal, false); }); }), "josi.credential-card.decline");
+      var help = card["help"]; var helpUrl = help["url"].Text;
+      var helpRow = Ui.Stack(4, Ui.Caption(help["text"].Text),
+        helpUrl.Length > 0 ? Ui.Link("Open " + new Uri(helpUrl).Host, () => { try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(helpUrl) { UseShellExecute = true }); } catch (Exception) { } }) : null);
+      sheet.Closed += delegate { Automation.PopupResult = "credential-card:" + outcome; };
+      sheet.Body(Ui.Stack(14,
+        Ui.Row(10, Ui.JosiMark(28), Automation.Id(Ui.T(card["title"].Text, 17, FontWeights.SemiBold), "josi.credential-card.title")),
+        Automation.Id(Ui.Copyable(card["intro"].Text, 14), "josi.credential-card.intro"),
+        body, helpRow, problem,
+        Ui.Caption("What you paste goes to this Josi's Vault only. Josi never sees it, and it never appears in the conversation."),
+        Ui.Spread(decline, Ui.Row(8, cancel, save))));
+      sheet.Loaded += delegate { sheet.Activate(); var first = inputs.Select(p => p.Item2).FirstOrDefault(); var entry = first as Ui.SecretEntry; if (entry != null) entry.Focus(); else if (first != null) first.Focus(); };
+      sheet.ShowDialog();
+    }
+    /// "Send to my devices": one file, to another of this person's devices
+    /// (it arrives by itself) or to another person here (they accept first).
+    public static void SendToDevice(Window owner, AppModel model, string path) {
+      var sheet = new Sheet(owner, "Josi", 540, "send-to-device");
+      var outcome = "cancelled";
+      var info = new FileInfo(path);
+      var body = new StackPanel();
+      var problem = Automation.Id(Ui.T("", 13, null, Ui.Error), "josi.send-to-device.error");
+      problem.Visibility = Visibility.Collapsed;
+      string target = null; Wire targets = null; Button go = null; Action render = null;
+      go = Automation.Id(Ui.Pill("Send", async () => {
+        if (target == null) return;
+        go.IsEnabled = false; problem.Visibility = Visibility.Collapsed;
+        try {
+          await model.SendTransfer(path, target.StartsWith("d:") ? target.Substring(2) : null, target.StartsWith("p:") ? target.Substring(2) : null);
+          outcome = "sent"; sheet.Close();
+        } catch (JosiException e) { problem.Text = e.Message; problem.Visibility = Visibility.Visible; go.IsEnabled = true; }
+      }, true), "josi.send-to-device.send");
+      go.IsEnabled = false; go.IsDefault = true;
+      var cancel = Automation.Id(Ui.Pill("Cancel", () => sheet.Close()), "josi.send-to-device.cancel");
+      cancel.IsCancel = true;
+      render = () => {
+        body.Children.Clear();
+        if (targets == null) { body.Children.Add(Ui.Secondary("Looking for your devices…")); return; }
+        var devices = targets["devices"].List.Select(d => new KeyValuePair<string, string>("d:" + d.Id, d["name"].Text)).ToList();
+        var people = targets["people"].List.Select(p => new KeyValuePair<string, string>("p:" + p.Id, p["name"].Text)).ToList();
+        Action<string> pick = key => { target = key; go.IsEnabled = true; render(); };
+        body.Children.Add(Ui.Stack(10,
+          Ui.Caption("Your devices"),
+          devices.Count == 0 ? (UIElement)Ui.Secondary("No other device is signed in to Josi as you yet. Open Josi on it once and it appears here.")
+            : Ui.Chips(devices, target, pick, "josi.send-to-device.target."),
+          people.Count == 0 ? null : Ui.Caption("People here (nothing is saved for them until they accept)"),
+          people.Count == 0 ? null : Ui.Chips(people, target, pick, "josi.send-to-device.target.")));
+      };
+      sheet.Closed += delegate { Automation.PopupResult = "send-to-device:" + outcome; };
+      sheet.Body(Ui.Stack(14,
+        Ui.T("Send a file", 17, FontWeights.SemiBold),
+        Automation.Id(Ui.T(info.Name + " · " + Wires.Bytes(info.Exists ? info.Length : 0), 14), "josi.send-to-device.file"),
+        body, problem,
+        Ui.Caption("To your own device it arrives in Downloads\\Josi by itself. Josi never opens a received file."),
+        Ui.Spread(null, Ui.Row(8, cancel, go))));
+      sheet.Loaded += async delegate {
+        render();
+        try { targets = await model.TransferTargets(); }
+        catch (JosiException e) { targets = Wires.Parse("{}"); problem.Text = e.Message; problem.Visibility = Visibility.Visible; }
+        render();
+      };
+      sheet.ShowDialog();
+    }
+    /// A file another person here wants to send to this person.
+    public static void TransferOffer(Window owner, AppModel model, Wire item) {
+      var sheet = new Sheet(owner, "Josi", 500, "transfer-offer");
+      var outcome = "later";
+      var accept = Automation.Id(Ui.Pill("Accept", () => { outcome = "accepted"; sheet.Close(); model.AcceptTransfer(item); }, true), "josi.transfer-offer.accept");
+      var decline = Automation.Id(Ui.Pill("Decline", () => { outcome = "declined"; sheet.Close(); model.DeclineTransfer(item); }), "josi.transfer-offer.decline");
+      var later = Automation.Id(Ui.Pill("Not now", () => sheet.Close()), "josi.transfer-offer.later");
+      later.IsCancel = true;
+      sheet.Closed += delegate { Automation.PopupResult = "transfer-offer:" + outcome; };
+      sheet.Body(Ui.Stack(14,
+        Automation.Id(Ui.T(item["from"].Text + " wants to send you a file", 17, FontWeights.SemiBold), "josi.transfer-offer.title"),
+        Automation.Id(Ui.T(item["name"].Text + " · " + Wires.Bytes(item["size"].Number), 14), "josi.transfer-offer.file"),
+        Ui.Caption("If you accept, it is saved to Downloads\\Josi on this computer. Josi does not open it."),
+        Ui.Spread(decline, Ui.Row(8, later, accept))));
+      sheet.Loaded += delegate { sheet.Activate(); later.Focus(); };
+      sheet.ShowDialog();
+    }
+    public static bool IsAccountCard(Wire proposal) {
+      return proposal["area"].Text == "credential_card" && proposal["card"]["kind"].Text == "account_connection";
+    }
+    /// "Connect my Google account", asked in conversation: one button that
+    /// opens the provider's sign-in page in the browser. Nothing is typed here.
+    public static void AccountCard(Window owner, AppModel model, Wire proposal) {
+      var card = proposal["card"]; var provider = card["provider"].Text;
+      var name = provider.Length > 0 ? char.ToUpperInvariant(provider[0]) + provider.Substring(1) : "the provider";
+      var sheet = new Sheet(owner, "Josi", 520, "account-card");
+      var outcome = "later";
+      var problem = Automation.Id(Ui.T("", 13, null, Ui.Error), "josi.account-card.error");
+      problem.Visibility = Visibility.Collapsed;
+      Button go = null;
+      go = Automation.Id(Ui.Pill("Sign in with " + name, async () => {
+        go.IsEnabled = false; problem.Visibility = Visibility.Collapsed;
+        try { await model.StartAccountCard(proposal, provider); outcome = "started"; sheet.Close(); }
+        catch (JosiException e) { problem.Text = e.Message; problem.Visibility = Visibility.Visible; go.IsEnabled = true; }
+      }, true), "josi.account-card.sign-in");
+      go.IsDefault = true;
+      var cancel = Automation.Id(Ui.Pill("Not now", () => { sheet.Close(); }), "josi.account-card.later");
+      cancel.IsCancel = true;
+      var decline = Automation.Id(Ui.Pill("Decline", () => { outcome = "declined"; sheet.Close(); model.Run(async () => { await model.DecideSettingsChange(proposal, false); }); }), "josi.account-card.decline");
+      sheet.Closed += delegate { Automation.PopupResult = "account-card:" + outcome; };
+      sheet.Body(Ui.Stack(14,
+        Ui.Row(10, Ui.JosiMark(28), Automation.Id(Ui.T(card["title"].Text, 17, FontWeights.SemiBold), "josi.account-card.title")),
+        Automation.Id(Ui.T(card["intro"].Text, 14), "josi.account-card.intro"),
+        Ui.Caption(card["help"]["text"].Text), problem,
+        Ui.Spread(decline, Ui.Row(8, cancel, go))));
+      sheet.Loaded += delegate { sheet.Activate(); go.Focus(); };
+      sheet.ShowDialog();
+    }
+    /// One secret value, typed by the person for their own World. Returns null
+    /// when cancelled; the box is cleared either way and the value is never logged.
+    public static string AskSecret(Window owner, string title, string detail, string label, string action) {
+      var sheet = new Sheet(owner, "Josi", 520, "secret");
+      string result = null;
+      var box = Ui.SecretField(label); Automation.Id(box.Hidden, "josi.secret.input");
+      var go = Automation.Id(Ui.Pill(action, () => { var value = box.Value.Trim(); if (value.Length == 0) return; result = value; box.Clear(); sheet.Close(); }, true), "josi.secret.ok");
+      go.IsDefault = true;
+      var cancel = Automation.Id(Ui.Pill("Cancel", () => { box.Clear(); sheet.Close(); }), "josi.secret.cancel");
+      cancel.IsCancel = true;
+      sheet.Closed += delegate { Automation.PopupResult = result == null ? "secret:cancelled" : "secret:ok"; };
+      sheet.Body(Ui.Stack(14, Ui.T(title, 17, FontWeights.SemiBold), detail == null ? null : Ui.Secondary(detail), Ui.Stack(5, Ui.T(label, 13.5), box), Ui.Spread(null, Ui.Row(8, cancel, go))));
+      sheet.Loaded += delegate { sheet.Activate(); box.Focus(); };
+      sheet.ShowDialog();
+      return result;
+    }
+    /// A secret shown on screen, once, to the person it belongs to: never spoken,
+    /// never kept by the app after the sheet closes.
+    public static void Reveal(Window owner, string title, string value) {
+      var sheet = new Sheet(owner, "Josi", 520, "reveal");
+      var shown = Automation.Id(Ui.Copyable(value, 20, null, true), "josi.reveal.value");
+      var ok = Automation.Id(Ui.Pill("Done", () => sheet.Close(), true), "josi.reveal.ok"); ok.IsDefault = true; ok.IsCancel = true;
+      sheet.Closed += delegate { shown.Text = ""; Automation.PopupResult = "reveal:closed"; };
+      sheet.Body(Ui.Stack(14, Ui.T(title, 17, FontWeights.SemiBold), shown, Ui.Caption("Shown here only. Josi never sees it, and it is not read aloud."), Ui.Spread(null, ok)));
+      sheet.ShowDialog();
+    }
+    /// Asks for the account password once, for a change the server protects
+    /// with it. Returns null when cancelled; the box is cleared either way.
+    public static string AskPassword(Window owner, string title, string detail, string action) {
+      var sheet = new Sheet(owner, "Josi", 520, "password");
+      string result = null;
+      var box = Automation.Id(Ui.Visible(Ui.Secret("Your account password")), "josi.password.input");
+      var go = Automation.Id(Ui.Pill(action, () => { if (box.Password.Length == 0) return; result = box.Password; box.Clear(); sheet.Close(); }, true), "josi.password.ok");
+      go.IsDefault = true;
+      var cancel = Automation.Id(Ui.Pill("Cancel", () => { box.Clear(); sheet.Close(); }), "josi.password.cancel");
+      cancel.IsCancel = true;
+      sheet.Closed += delegate { Automation.PopupResult = result == null ? "password:cancelled" : "password:ok"; };
+      sheet.Body(Ui.Stack(14, Ui.T(title, 17, FontWeights.SemiBold), detail == null ? null : Ui.Copyable(detail, 14, Ui.Muted),
+        Ui.Field("Confirm your account password", box), Ui.Spread(null, Ui.Row(8, cancel, go))));
+      sheet.Loaded += delegate { box.Focus(); };
+      sheet.ShowDialog();
+      return result;
+    }
+
+    /// Writes a private file (current user only) beside the destination, then moves it into place.
+    public static void WritePrivate(string destination, string text) {
+      var folder = Path.GetDirectoryName(Path.GetFullPath(destination));
+      var temporary = Path.Combine(folder, ".josi-recovery-" + Guid.NewGuid().ToString("N"));
+      var security = new FileSecurity();
+      security.SetAccessRuleProtection(true, false);
+      security.AddAccessRule(new FileSystemAccessRule(WindowsIdentity.GetCurrent().User, FileSystemRights.FullControl, AccessControlType.Allow));
+      var bytes = Encoding.UTF8.GetBytes(text);
+      try {
+        using (var stream = new FileInfo(temporary).Create(FileMode.CreateNew, FileSystemRights.Write, FileShare.None, 4096, FileOptions.WriteThrough, security)) {
+          stream.Write(bytes, 0, bytes.Length); stream.Flush(true);
+        }
+        if (File.Exists(destination)) File.Replace(temporary, destination, null); else File.Move(temporary, destination);
+      } finally {
+        Array.Clear(bytes, 0, bytes.Length);
+        try { if (File.Exists(temporary)) File.Delete(temporary); } catch (IOException) { }
+      }
+    }
+    public static bool SaveRecoveryKey(Window owner, string key, string fingerprint) {
+      if (key.Length == 0) throw new JosiException("The recovery key is unavailable.");
+      var dialog = new Microsoft.Win32.SaveFileDialog { FileName = "Josi-Vault-Recovery.txt", Filter = "Text file (*.txt)|*.txt" };
+      if (dialog.ShowDialog(owner) != true) return false;
+      try { WritePrivate(dialog.FileName, "Josi Vault recovery key\r\n\r\n" + key + "\r\n\r\nFingerprint: " + fingerprint + "\r\n"); return true; }
+      catch (Exception) { Message(owner, "The recovery key could not be saved.", "Choose another location."); return false; }
+    }
+
+    public static void ShowRecoveryIfNeeded(Window owner, AppModel model) {
+      if (recoveryOpen || (model.VaultRecovery.IsNull && model.MfaRecovery.IsNull)) return;
+      recoveryOpen = true;
+      owner.Dispatcher.BeginInvoke(new Action(() => {
+        try {
+          if (!model.MfaRecovery.IsNull) MfaRecovery(owner, model);
+          else if (!model.VaultRecovery.IsNull) VaultRecovery(owner, model);
+        } finally { recoveryOpen = false; }
+        model.Notify();
+      }));
+    }
+    static void VaultRecovery(Window owner, AppModel model) {
+      var sheet = new Sheet(owner, "Save Your Vault Recovery Key", 600, "vault-recovery") { Locked = true };
+      var key = model.VaultRecovery["recoveryKey"].Text; var fingerprint = model.VaultRecovery["fingerprint"].Text;
+      var shown = Ui.Copyable(key, 14, null, true); shown.Visibility = Visibility.Collapsed;
+      var show = Ui.Toggle("Show recovery key");
+      show.Checked += delegate { shown.Visibility = Visibility.Visible; }; show.Unchecked += delegate { shown.Visibility = Visibility.Collapsed; };
+      var saved = Ui.Toggle("I have saved my recovery key");
+      var done = Ui.Pill("Done", () => { sheet.Locked = false; model.VaultRecovery = Wire.Null; sheet.Close(); }, true);
+      done.IsEnabled = false;
+      saved.Checked += delegate { done.IsEnabled = true; }; saved.Unchecked += delegate { done.IsEnabled = false; };
+      sheet.Body(Ui.Stack(18, Ui.Title2("Save Your Vault Recovery Key"),
+        Ui.T("Keep this recovery copy somewhere safe outside Josi. Losing both it and the installation key makes your Vault unrecoverable. This key will not be shown again."),
+        Ui.Copyable("Fingerprint: " + fingerprint, 12, Ui.Muted), show, shown,
+        Ui.Pill("Save Recovery Key…", () => { if (SaveRecoveryKey(sheet, key, fingerprint)) saved.IsChecked = true; }),
+        saved, done));
+      sheet.ShowDialog();
+    }
+    static void MfaRecovery(Window owner, AppModel model) {
+      var sheet = new Sheet(owner, "Save your sign-in recovery codes", 560, "mfa-recovery") { Locked = true };
+      var value = model.MfaRecovery;
+      var codes = string.Join("\r\n", value["codes"].List.Select(c => c.Text));
+      var shown = Ui.Copyable(codes, 14, null, true); shown.Visibility = Visibility.Collapsed;
+      var show = Ui.Toggle("Show recovery codes");
+      show.Checked += delegate { shown.Visibility = Visibility.Visible; }; show.Unchecked += delegate { shown.Visibility = Visibility.Collapsed; };
+      var confirmed = Ui.Toggle("I have stored these recovery codes safely");
+      var note = Ui.Caption("");
+      var done = Ui.Pill("Done", () => { sheet.Locked = false; model.MfaRecovery = Wire.Null; sheet.Close(); }, true);
+      done.IsEnabled = false;
+      confirmed.Checked += delegate { done.IsEnabled = true; }; confirmed.Unchecked += delegate { done.IsEnabled = false; };
+      sheet.Body(Ui.Stack(16, Ui.Title2("Save your sign-in recovery codes"),
+        Ui.T("Each code works once if your authenticator is unavailable. Keep them in a safe place; Josi will not display them again."),
+        show, shown,
+        Ui.Pill("Save Private Recovery File…", () => {
+          var dialog = new Microsoft.Win32.SaveFileDialog { FileName = "Josi-sign-in-recovery.txt", Title = "Save your one-time sign-in recovery codes", Filter = "Text file (*.txt)|*.txt" };
+          if (dialog.ShowDialog(sheet) != true) return;
+          try {
+            WritePrivate(dialog.FileName, "Josi sign-in recovery codes\r\nAccount: " + value["account"].Text + "\r\nServer: " + value["server"].Text
+              + "\r\n\r\nEach code works once. Keep this file private.\r\n\r\n" + codes + "\r\n");
+            note.Text = "Saved with private file permissions. Confirm that you have stored it safely.";
+          } catch (Exception) { note.Text = "The recovery file could not be saved. Choose another location."; }
+        }),
+        confirmed, note, done));
+      sheet.ShowDialog();
+    }
+
+    /// Asks the server to email a password-reset link. The server answers the
+    /// same way whether or not the account exists.
+    public static void ForgotPassword(Window owner, AppModel model, string identifierText) {
+      var sheet = new Sheet(owner, "Forgot your password?", 520, "forgot-password");
+      var identifier = Ui.Input("Username or email", identifierText ?? "");
+      var note = Ui.Secondary("");
+      var api = model.Api;
+      Action request = () => {
+        var value = identifier.Text.Trim();
+        if (value.Length == 0 || value.Length > 254 || api == null) { note.Text = "Enter your username or email."; return; }
+        note.Text = "";
+        model.Run(async () => {
+          await api.Request("/auth/forgot-password", "POST", Wires.O("identifier", value));
+          note.Text = "If that account exists and this server can send email, a reset link is on its way. Open it, or paste it under \"Have an invitation or reset link?\" on the sign-in page.";
+        });
+      };
+      identifier.KeyDown += (s, e) => { if (e.Key == Key.Enter) request(); };
+      var send = Ui.Pill("Send Reset Link", request, true);
+      send.IsDefault = true;
+      sheet.Body(Ui.Stack(14, Ui.Title2("Forgot your password?"),
+        Ui.T("Enter the username or email for your Josi account and the server will email you a reset link."),
+        Ui.Field("Username or email", identifier), send, note,
+        Ui.Caption("This needs email delivery set up on the server. If it is not, an administrator can create a reset link for you in People."),
+        Ui.Spread(Ui.Link("I already have a reset link", () => { sheet.Close(); PasswordSetup(owner, model); }), Ui.Pill("Close", () => sheet.Close()))));
+      sheet.Loaded += delegate { identifier.Focus(); };
+      sheet.ShowDialog();
+    }
+
+    /// Pairs this PC with a server, from a code or link made on that server.
+    public static void PairServer(Window owner, AppModel model) {
+      var sheet = new Sheet(owner, "Pair This PC", 520, "pair");
+      var input = Automation.Id(Ui.Input("Pairing code or link"), "josi.pair.code");
+      var note = Ui.Secondary("");
+      Action pair = () => {
+        var value = input.Text.Trim();
+        if (value.Length == 0) { note.Text = "Paste the code or link from your server."; return; }
+        note.Text = "Pairing…";
+        model.Run(async () => {
+          try { await model.Pair(value); input.Text = ""; sheet.Close(); }
+          catch (JosiException e) { note.Text = e.Message; }
+        });
+      };
+      var go = Automation.Id(Ui.Pill("Pair", pair, true), "josi.pair.ok");
+      go.IsDefault = true;
+      sheet.Body(Ui.Stack(14, Ui.Title2("Pair This PC"),
+        Ui.T("On your server, make a pairing code. Then paste the code or link here."),
+        Ui.Field("Pairing code or link", input), note,
+        Ui.Spread(go, Ui.Pill("Close", () => sheet.Close()))));
+      sheet.Loaded += delegate { input.Focus(); };
+      sheet.ShowDialog();
+    }
+
+    /// Sets a password from an invitation or reset link for the connected server.
+    public static void PasswordSetup(Window owner, AppModel model) {
+      var sheet = new Sheet(owner, "Invitation or password reset", 560, "password-setup");
+      var input = Ui.Input("Paste the one-time link or code");
+      var password = new NewPassword("New password");
+      var note = Ui.Secondary("");
+      var token = ""; var inspected = Wire.Null;
+      var api = model.Api;
+      var host = new ContentControl { Focusable = false };
+      Action render = null;
+      Action save = null;
+      save = () => {
+        if (!password.Valid) return;
+        var secret = password.Password; password.Clear(); var selected = token;
+        model.Run(async () => {
+          var result = await api.Request("/auth/set-password", "POST", Wires.O("token", selected, "password", secret, "signIn", false));
+          token = ""; inspected = Wire.Null;
+          if (!result["passwordChanged"].Flag) {
+            // Older servers may have created a session. Close it instead
+            // of treating password recovery as an authenticator bypass.
+            await api.Request("/auth/logout", "POST", Wires.O());
+            await api.PrimeCsrf();
+            note.Text = "The server completed password recovery. Close this panel and sign in normally.";
+          } else note.Text = "Password saved. Close this panel and sign in with your new password.";
+          render();
+        });
+      };
+      password.Submitted += () => save();
+      render = () => {
+        if (inspected.IsNull) {
+          host.Content = Ui.Stack(12, Ui.T("Paste the one-time link or code you received for this server."), input,
+            Ui.Pill("Check Link", () => {
+              var value = input.Text.Trim(); input.Text = ""; note.Text = "";
+              try {
+                var selected = ParseToken(value, api);
+                model.Run(async () => {
+                  var result = await api.Request("/auth/token/inspect", "POST", Wires.O("token", selected));
+                  if (result["purpose"].Text != "invite" && result["purpose"].Text != "reset" || result["username"].Text.Length == 0)
+                    throw new JosiException("This link could not be verified.");
+                  token = selected; inspected = result; render();
+                });
+              } catch (JosiException e) { note.Text = e.Message; }
+            }, true),
+            Ui.Link("Need a reset link? Request one", () => { sheet.Close(); ForgotPassword(owner, model, ""); }));
+        } else {
+          var saveButton = Ui.Pill("Save Password", save, true);
+          saveButton.IsEnabled = password.Valid;
+          password.Changed += delegate { saveButton.IsEnabled = password.Valid; };
+          Ui.Detach(password);
+          host.Content = Ui.Stack(12, Ui.Headline("Set a password for " + inspected["username"].Text), password, saveButton,
+            Ui.Caption("Saving ends existing sign-ins. Sign in normally afterward; any enabled authenticator is still required."),
+            Ui.Pill("Use Another Link", () => { token = ""; inspected = Wire.Null; render(); }));
+          Dispatcher.CurrentDispatcher.BeginInvoke(new Action(() => password.Focus()), System.Windows.Threading.DispatcherPriority.Background);
+        }
+      };
+      render();
+      sheet.Body(Ui.Stack(16, Ui.Title2("Invitation or password reset"), host, note, Ui.Spread(null, Ui.Pill("Close", () => sheet.Close()))));
+      sheet.ShowDialog();
+      password.Clear();
+    }
+    static string ParseToken(string value, JosiApi api) {
+      const string pattern = "^[A-Za-z0-9_-]{43}$";
+      if (Regex.IsMatch(value, pattern)) return value;
+      Uri link;
+      if (value.Length > 4096 || !Uri.TryCreate(value, UriKind.Absolute, out link) || link.Scheme != api.Origin.Scheme
+          || !string.Equals(link.Host, api.Origin.Host, StringComparison.OrdinalIgnoreCase) || link.Port != api.Origin.Port
+          || link.UserInfo.Length > 0 || link.Fragment.Length > 0 || link.AbsolutePath != "/set-password") {
+        throw new JosiException("Use a valid invitation or reset link for the server shown here. If its address differs, reconnect to the address in the link first.");
+      }
+      var match = Regex.Match(link.Query, "^\\?token=([A-Za-z0-9_-]{43})$");
+      if (!match.Success) throw new JosiException("Use a valid invitation or reset link for the server shown here. If its address differs, reconnect to the address in the link first.");
+      return match.Groups[1].Value;
+    }
+
+    public static void MemorySource(Window owner, AppModel model, Wire source) {
+      var sheet = new Sheet(owner, "Source work", 660, "memory-source");
+      var body = new ContentControl { Content = Ui.Caption("Loading…"), Focusable = false };
+      sheet.Body(Ui.Stack(16, Ui.Spread(Ui.Title2("Source work"), Ui.Pill("Close", () => sheet.Close())), body));
+      sheet.Loaded += async delegate {
+        var api = model.Api; if (api == null) return;
+        try {
+          var id = api.Uuid(source["work_goal_id"].Text);
+          var value = await api.Request("/assistant/work-goals/" + id);
+          var goal = value["goal"];
+          if (goal["goalId"].Text != id) throw new JosiException("The original work is unavailable on this server.");
+          var stack = Ui.Stack(10, Ui.Headline(goal["title"].Text),
+            Ui.T(goal["verifiedSteps"].Integer + "/" + goal["totalSteps"].Integer + " steps verified · " + goal["state"].Text), Ui.Headline("Finished means"));
+          foreach (var c in goal["criteria"].List) Ui.Add(stack, Ui.Copyable("• " + c.Text), 4);
+          foreach (var s in goal["steps"].List) Ui.Add(stack, Ui.T((s["state"].Text == "verified" ? "✓ " : "• ") + s["title"].Text), 4);
+          Ui.Add(stack, Ui.Caption("Lesson source revision: " + source["work_goal_revision"].Integer + " · Current saved revision: " + goal["revision"].Integer), 8);
+          var thread = goal["threadId"].Text;
+          Ui.Add(stack, Ui.Pill("Open Original Conversation", () => { sheet.Close(); model.Run(() => model.SelectThread(thread)); }), 10);
+          body.Content = stack;
+        } catch (JosiException) { body.Content = Ui.T("The original work is unavailable on this server.", 14, null, Ui.Accent); }
+      };
+      sheet.ShowDialog();
+    }
+
+    public static void VoiceSettings(Window owner, AppModel model, Voice voice) {
+      var sheet = new Sheet(owner, "Voice Box", 500, "voice-settings");
+      var host = new ContentControl { Focusable = false };
+      var error = ""; var working = false;
+      var selected = "af_heart"; var transcription = "base.en";
+      Action render = null;
+      Action sync = () => {
+        var saved = voice.Settings["settings"];
+        if (saved["voice"].Text.Length > 0) { selected = saved["voice"].Text; transcription = saved["model"].Text; }
+      };
+      Action<string> perform = async operation => {
+        var api = model.Api; if (api == null) return;
+        working = true; error = ""; render();
+        try {
+          object body = Wires.O();
+          if (operation == "settings" && voice.Settings["settings"].Raw is IDictionary<string, object>) {
+            var saved = new Dictionary<string, object>((IDictionary<string, object>)voice.Settings["settings"].Raw);
+            saved["voice"] = selected; saved["model"] = transcription; body = saved;
+          }
+          await api.Request("/admin/voice-box/" + operation, "POST", body);
+          for (var i = 0; i < 20; i++) {
+            await voice.Refresh(api); sync();
+            if (voice.Available || voice.Settings["phase"].Text != "working") break;
+            await System.Threading.Tasks.Task.Delay(2000);
+          }
+        } catch (JosiException e) { error = e.Message; }
+        finally { working = false; render(); }
+      };
+      render = () => {
+        var stack = Ui.Stack(16,
+          Ui.Secondary("Dictate into the message box, or talk with Josi and hear its replies. Audio is processed by Voice Box on your Josi server."),
+          Ui.Row(10, Ui.Icon(voice.Available ? Glyph.Check : Glyph.Wave, 18, voice.Available ? Ui.Green : Ui.Accent), Ui.Headline(voice.Available ? "Speech models are ready" : "Voice Box needs setup")));
+        if (model.IsAdministrator) {
+          if (voice.Settings["verified"].Flag) {
+            var voices = Ui.Choice(Ui.Options("af_heart", "Kokoro · Heart", "af_bella", "Kokoro · Bella"), selected);
+            voices.SelectionChanged += delegate { selected = Ui.Selected(voices); };
+            var models = Ui.Choice(Ui.Options("base.en", "Whisper Base · English", "tiny.en", "Whisper Tiny · English"), transcription);
+            models.SelectionChanged += delegate { transcription = Ui.Selected(models); };
+            Ui.Add(stack, Ui.Field("Speaking voice", voices), 16);
+            Ui.Add(stack, Ui.Field("Dictation model", models), 16);
+            Ui.Add(stack, Ui.Pill("Save voice settings", () => perform("settings"), true), 16);
+            Ui.Add(stack, Ui.Pill("Restart Voice Box", () => perform("restart")), 10);
+          } else {
+            Ui.Add(stack, Ui.T(voice.Settings["error"].Text.Length == 0 ? "Enable the included local speech models to use voice controls." : voice.Settings["error"].Text), 16);
+            var enable = Ui.Pill("Enable Voice Box", () => perform("install"), true);
+            enable.IsEnabled = voice.Settings["helperAvailable"].Flag && voice.Settings["releaseAvailable"].Flag;
+            Ui.Add(stack, enable, 12);
+          }
+        } else Ui.Add(stack, Ui.T("Your server administrator manages the voice models."), 16);
+        // Anyone may hear the voice before deciding to talk with it.
+        if (voice.Available) Ui.Add(stack, Ui.Pill(voice.Speaking ? "Stop the Sample" : "Hear a Sample", () => {
+          var api = model.Api; if (api == null) return;
+          if (voice.Speaking) { voice.Interrupt(); render(); return; }
+          voice.Speak("Hi, I’m Josi. This is how I sound when we talk. What would you like to work on today?", api)
+            .ContinueWith(t => { if (t.Exception != null) error = AppModel.Friendly(t.Exception.InnerException); render(); }, System.Threading.Tasks.TaskScheduler.FromCurrentSynchronizationContext());
+          render();
+        }), 12);
+        if (error.Length > 0) Ui.Add(stack, Ui.T(error, 13, null, Ui.Error), 12);
+        if (working) Ui.Add(stack, Ui.Caption("Checking speech models…"), 12);
+        stack.IsEnabled = !working;
+        host.Content = stack;
+      };
+      sheet.Loaded += async delegate { var api = model.Api; if (api != null) { await voice.Refresh(api); sync(); render(); } };
+      render();
+      sheet.Body(Ui.Stack(16, Ui.Spread(Ui.Title2("Voice Box"), Ui.Pill("Done", () => sheet.Close())), host));
+      sheet.ShowDialog();
+    }
+  }
+}

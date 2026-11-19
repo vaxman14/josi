@@ -1,0 +1,10 @@
+# syntax=docker/dockerfile:1.7
+# v6-b38 (2026-11-19): the graphics card of any vendor. Only the entrypoint and the Ollama unit change (a few kilobytes);
+# the model layer, the operating system layer and Josi's package are reused byte for byte from v6-b37.
+#   docker build -f Dockerfile.update-b38 -t josi-allinone:v6-b38 .     (run in this folder, after pulling v6-b37)
+# Pushed to Docker Hub from the build machine; copied to public ECR with a registry-to-registry copy (only the new small layers move).
+FROM josi-allinone:v6-b37
+COPY josi-allinone-entry /usr/local/sbin/josi-allinone-entry
+COPY ollama-allinone.service /etc/systemd/system/ollama-allinone.service
+RUN chmod 0755 /usr/local/sbin/josi-allinone-entry
+LABEL org.opencontainers.image.version="1.2.8-beta.37+gpu" org.opencontainers.image.base.name="josi-allinone:v6-b37"

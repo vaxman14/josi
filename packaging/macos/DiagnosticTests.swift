@@ -1,0 +1,36 @@
+import Foundation
+import Darwin
+
+@main struct DiagnosticTests {
+    static func main() throws {
+        guard CommandLine.arguments.count == 2 else { fatalError("Disposable fixture directory required") }
+        let root = URL(fileURLWithPath: CommandLine.arguments[1])
+        guard root.path.hasPrefix("/Users/roman/Documents/Josi Mac Native/JosiDrive/") else { fatalError("External fixture required") }
+        let folder = root.appendingPathComponent(UUID().uuidString)
+        var location: URL!
+        do {
+            let log = try DiagnosticLog(directory: folder, operation: "verification")
+            location = log.url
+            let uri = "postgres://" + "user:unsafe" + "@localhost/db"
+            try log.append("Payload hash mismatch: app/file.js\npassword=unsafe token=unsafe " + uri + "\n" + String(repeating: "a", count: 64))
+            let during = try String(contentsOf: location, encoding: .utf8)
+            precondition(during.contains("Payload hash mismatch: app/file.js"))
+            precondition(!during.contains("unsafe")); precondition(during.contains("[redacted]"))
+        }
+        let after = try String(contentsOf: location, encoding: .utf8)
+        precondition(after.contains("verification started"))
+        let attrs = try FileManager.default.attributesOfItem(atPath: location.path)
+        precondition((attrs[.posixPermissions] as! NSNumber).intValue == 0o600)
+        let linked = root.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createSymbolicLink(at: linked, withDestinationURL: folder)
+        do { _ = try DiagnosticLog(directory: linked, operation: "installation"); fatalError("Linked folder accepted") } catch {}
+        let wrapped = "0:859: execution error: {\"phase\":\"Stopping Josi\"}\n{\"result\":\"failure\",\"cause\":\"macOS denied removal; token=unsafe\"} (1)"
+        precondition(DiagnosticLog.failureCause(in:wrapped) == "macOS denied removal; token=[redacted]")
+        precondition(DiagnosticLog.failureCause(in:"{\"result\":\"success\"}") == nil)
+        let denied = "0:859: execution error: {\"result\":\"failure\",\"cause\":\"Account deletion blocked\",\"recovery\":\"full-disk-access\"} (1)"
+        precondition(DiagnosticLog.requiresFullDiskAccess(in:denied))
+        precondition(!DiagnosticLog.requiresFullDiskAccess(in:wrapped))
+        precondition(!DiagnosticLog.requiresFullDiskAccess(in:"{\"result\":\"success\",\"recovery\":\"full-disk-access\"}"))
+        print("PASS diagnostic durability, cause retention, credential redaction, private permissions and linked-folder refusal")
+    }
+}

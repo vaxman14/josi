@@ -1,0 +1,15 @@
+[Unit]
+Description=Load the Josi model once
+After=ollama-allinone.service
+Requires=ollama-allinone.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/josi-allinone-warm
+TimeoutStartSec=1000
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

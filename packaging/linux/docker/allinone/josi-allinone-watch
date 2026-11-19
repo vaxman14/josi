@@ -1,0 +1,22 @@
+#!/bin/bash
+# Once Josi has come up, watches Ollama and Josi. If either stops answering for a
+# minute, this exits with an error; systemd then ends the container (see
+# josi-allinone-watch.service) so Docker's restart policy brings it back.
+set -u
+if [ -c /dev/console ]; then exec > >(tee /dev/console) 2>&1; fi
+i=0
+until curl -fsS --max-time 5 http://127.0.0.1:8080/ready >/dev/null 2>&1; do
+  i=$((i + 1))
+  [ "$i" -lt 120 ] || { echo "Josi did not come up within ten minutes."; exit 1; }
+  sleep 5
+done
+bad=0
+while sleep 15; do
+  if curl -fsS --max-time 5 http://127.0.0.1:11434/api/version >/dev/null 2>&1 && curl -fsS --max-time 5 http://127.0.0.1:8080/ready >/dev/null 2>&1; then
+    bad=0
+  else
+    bad=$((bad + 1))
+    echo "Ollama or Josi did not answer ($bad of 4)."
+    [ "$bad" -lt 4 ] || { echo "Stopping the container so Docker can restart it."; exit 1; }
+  fi
+done

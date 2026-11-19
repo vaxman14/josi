@@ -1,0 +1,109 @@
+#!/bin/bash
+# Runs at every start of the Josi container: configures and starts Josi with
+# the package's own installer command, then prints the setup address on the
+# container's console (docker logs). Safe to repeat: it repairs and keeps data.
+#
+# Environment (docker run -e):
+#   JOSI_HOST_ADDRESS  the address people use to reach this machine (default: the container's address)
+#   JOSI_HOST_PORT     the port published for 8080 (default 8080)
+#   JOSI_PUBLIC_URL    the https address people use when Josi is published through
+#                      a tunnel or a reverse proxy that ends TLS, for example
+#                      https://josi.example.com. Links, sign-in cookies and the
+#                      setup link then use it, and JOSI_HOST_ADDRESS is not used.
+#   JOSI_PC_CONTROL    1 (default) or 0: let Josi control the container as user josi
+#   JOSI_BROWSER       1 (default) or 0: Josi's own browser on a hidden screen
+#   JOSI_BACKUP_DIR    a folder mounted into the container for backups (docker run -v /host/folder:/backups
+#                      -e JOSI_BACKUP_DIR=/backups): nightly and one-click backups are copied there
+#   JOSI_OPEN_SETUP    1 (default) or 0: the first visitor on the LAN starts setup without the one-use
+#                      link (lan address only; a published https address always needs the link)
+set -uo pipefail
+# `docker logs` shows the console, and a container has one only when it was
+# started with a terminal (docker run -t, or `tty: true` in Compose). Without
+# one, systemd has nowhere to print and writing to /dev/console would only make
+# an ordinary file nobody reads. Everything below is in the journal either way:
+#   docker exec <name> journalctl -u josi-firstboot -o cat
+if [ -c /dev/console ]; then exec > >(tee /dev/console) 2>&1; fi
+
+# systemd does not pass `docker run -e` on to its services; the container's
+# first process (PID 1) still holds them.
+while IFS= read -r -d '' pair; do
+  case $pair in JOSI_HOST_ADDRESS=* | JOSI_HOST_PORT=* | JOSI_PUBLIC_URL=* | JOSI_PC_CONTROL=* | JOSI_BROWSER=* | JOSI_TESTER_TOKEN=* | JOSI_DOCKER_VERSION=* | JOSI_REPORT_URL=* | JOSI_OPEN_SETUP=* | JOSI_BACKUP_DIR=*) export "$pair" ;; esac
+done < /proc/1/environ
+
+# A beta tester's token, for crash reports (see docs/CRASH_REPORTS.md). The token is the only
+# thing that identifies the tester; Josi reads it from this file. The Docker version is only a fact
+# about the machine for the report.
+if [[ "${JOSI_TESTER_TOKEN:-}" =~ ^[A-Za-z0-9_-]{20,128}$ ]]; then
+  docker_version=${JOSI_DOCKER_VERSION:-}
+  [[ "$docker_version" =~ ^[A-Za-z0-9._+~-]{0,40}$ ]] || docker_version=''
+  # JOSI_REPORT_URL points reports at a staging site; the services start with a wiped environment, so it goes in the file too.
+  report_url=${JOSI_REPORT_URL:-}
+  url_pattern='^https?://[A-Za-z0-9._~:/?&=%+-]{1,200}$'
+  [[ "$report_url" =~ $url_pattern ]] || report_url=''
+  mkdir -p /etc/josi
+  printf '{"token":"%s","docker_version":"%s","report_url":"%s"}
+' "$JOSI_TESTER_TOKEN" "$docker_version" "$report_url" > /etc/josi/tester.json.new && chmod 0644 /etc/josi/tester.json.new && mv /etc/josi/tester.json.new /etc/josi/tester.json
+fi
+
+address=${JOSI_HOST_ADDRESS:-$(ip -4 -o addr show scope global | awk '{split($4, a, "/"); print a[1]; exit}')}
+port=${JOSI_HOST_PORT:-8080}
+public=${JOSI_PUBLIC_URL:-}
+public=${public%/}
+if [ -n "$public" ]; then
+  # Behind a tunnel or proxy: Josi still listens on plain 8080 inside, and
+  # treats the https name as its one address.
+  args=(--address-mode proxy --public-url "$public" --port 8080)
+  open=$public
+else
+  args=(--address-mode lan --lan-address "$address" --port 8080)
+  open="http://${address}:${port}"
+  # Nobody sees this console on Unraid or in a Docker GUI, so the first person to open the page on the
+  # LAN starts setup by themselves. JOSI_OPEN_SETUP=0 keeps the one-use link instead.
+  if [ "${JOSI_OPEN_SETUP:-1}" = 1 ]; then args+=(--open-setup); else args+=(--no-open-setup); fi
+fi
+if [ "${JOSI_PC_CONTROL:-1}" = 1 ]; then
+  args+=(--pc-control-user josi)
+  if [ "${JOSI_BROWSER:-1}" = 1 ]; then args+=(--browser); else args+=(--no-browser); fi
+else
+  args+=(--no-pc-control)
+fi
+
+# The backup folder. The services read its path from /etc/josi/backup-dir (they start with a wiped
+# environment); the folder itself is opened up for them after the installer has made their group.
+backup_dir=${JOSI_BACKUP_DIR:-}
+backup_dir=${backup_dir%/}
+backup_pattern='^/[A-Za-z0-9._/ -]{1,200}$'
+if [[ "$backup_dir" =~ $backup_pattern && "$backup_dir" != *..* && -d "$backup_dir" ]]; then
+  mkdir -p /etc/josi
+  printf '%s\n' "$backup_dir" > /etc/josi/backup-dir.new && chmod 0644 /etc/josi/backup-dir.new && mv /etc/josi/backup-dir.new /etc/josi/backup-dir
+else
+  backup_dir=''
+  rm -f /etc/josi/backup-dir
+fi
+
+echo "Josi is starting (this takes about a minute)…"
+# Data volumes from an earlier container: the service accounts and units an
+# install makes lived in that container, not in the volumes. Put them back
+# before the installer looks for them. Does nothing on a first start or when
+# this same container starts again.
+/usr/bin/python3 /usr/local/sbin/josi-adopt.py || echo "The earlier container's services could not be restored; the installer will say what is missing."
+url=$(/usr/bin/josi-ce-server-install "${args[@]}" 2>/tmp/josi-firstboot.err) || {
+  echo "Josi did not start:"; tail -n 20 /tmp/josi-firstboot.err; exit 1
+}
+if [ -n "$backup_dir" ]; then
+  # Group josi-ce-app is what the web and worker services share; the folder is theirs to write and anyone's to list.
+  chgrp josi-ce-app "$backup_dir" 2>/dev/null && chmod 2775 "$backup_dir" 2>/dev/null || chmod 0777 "$backup_dir" 2>/dev/null || true
+fi
+# Tells the web service that a restored backup's installation key can be put in place (josi-keyswap).
+if [ -d /var/lib/josi/data/state ] && [ -x /usr/local/sbin/josi-keyswap ]; then
+  : > /var/lib/josi/data/state/keyswap.ready && chmod 0644 /var/lib/josi/data/state/keyswap.ready
+  # Enabled in the image; started here too in case it is not running (no-block: this unit is still starting).
+  systemctl start --no-block josi-keyswap.path >/dev/null 2>&1 || true
+fi
+# The installer prints the machine's own address; people reach it on the published one.
+fragment=${url#*#}
+if [ "$fragment" != "$url" ]; then
+  echo "Open this to set Josi up (works once, for 10 minutes): ${open}/setup#${fragment}"
+else
+  echo "Josi is running. Open it at: ${open}/"
+fi

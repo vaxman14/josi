@@ -1,0 +1,242 @@
+// The super admin's surface.
+//
+// Everything here configures the installation. Nothing here reads a member's
+// private resource, and the tests assert that rather than trusting the comment.
+import { Router } from 'express';
+import {
+  appendEvent, ensureWorkspace, getWorkspace, listEvents, updateWorkspace, type Db,
+  ApnsKeyError, ApnsSender, DEFAULT_APPLE_BUNDLE_ID, DEFAULT_APPLE_TEAM_ID, applePushKeyStatus, deleteApplePushKey,
+  loadMasterKey, saveApplePushKey, validateApnsCredentials, type ApnsTransport, type LoadOptions,
+} from '@josi-ce/core';
+import {
+  UserError, createUser, generatePassword, issueAuthToken, listUsers, updateUser,
+  listActiveSessions, revokeAllSessions, revokeSession,
+} from '@josi-ce/auth';
+import { asyncRoute, param } from './async.js';
+import { requireSuperAdmin } from './authz.js';
+
+export interface AdminRoutesCtx {
+  db: Db;
+  /** Where an invite link points. Set from the configured public URL. */
+  appUrl: string;
+  /** Opens the Vault to seal the Apple push key. `false` means no secure storage. */
+  masterKey?: LoadOptions | false;
+  /** Apple's push service, injected so tests never contact Apple. */
+  apnsTransport?: ApnsTransport;
+}
+
+export function adminRoutes(ctx: AdminRoutesCtx): Router {
+  const r = Router();
+  const { db } = ctx;
+  r.use(requireSuperAdmin);
+
+  // ------------------------------------------------------- iPhone notifications
+  // The key is pasted once, checked with Apple, sealed, and never returned.
+  r.get('/push/apple', asyncRoute(async (_req, res) => res.json({
+    ...await applePushKeyStatus(db), defaultTeamId: DEFAULT_APPLE_TEAM_ID, bundleId: DEFAULT_APPLE_BUNDLE_ID,
+  })));
+  r.put('/push/apple', asyncRoute(async (req, res) => {
+    let key; try { key = ctx.masterKey === false ? null : loadMasterKey(ctx.masterKey ?? {}); } catch { key = null; }
+    if (!key) return res.status(503).json({ error: 'Secure storage is unavailable, so the key cannot be saved.' });
+    let credentials;
+    try {
+      credentials = validateApnsCredentials({
+        keyId: req.body?.key_id, teamId: req.body?.team_id || DEFAULT_APPLE_TEAM_ID, privateKey: req.body?.private_key,
+      });
+    } catch (error) {
+      if (error instanceof ApnsKeyError) return res.status(400).json({ error: error.message, code: error.code });
+      throw error;
+    }
+    const checked = await new ApnsSender(credentials, ctx.apnsTransport).check();
+    if (checked === 'rejected') {
+      return res.status(400).json({
+        code: 'key_rejected',
+        error: 'Apple did not accept this key. Check that the Key ID and Team ID match the key, and that the key has Apple Push Notifications turned on.',
+      });
+    }
+    await saveApplePushKey(db, key, { actorUserId: req.user!.id, credentials, checked });
+    await appendEvent(db, {
+      actorUserId: req.user!.id, actor: 'super_admin', kind: 'push.apple_key_saved',
+      payload: { keyId: credentials.keyId, teamId: credentials.teamId, checked },
+    });
+    return res.json({ ...await applePushKeyStatus(db), defaultTeamId: DEFAULT_APPLE_TEAM_ID, bundleId: DEFAULT_APPLE_BUNDLE_ID });
+  }));
+  r.delete('/push/apple', asyncRoute(async (req, res) => {
+    if (await deleteApplePushKey(db, req.user!.id)) {
+      await appendEvent(db, { actorUserId: req.user!.id, actor: 'super_admin', kind: 'push.apple_key_removed', payload: {} });
+    }
+    return res.status(204).end();
+  }));
+
+  // ------------------------------------------------------------- workspace
+  r.get('/workspace', asyncRoute(async (_req, res) => res.json({ workspace: await getWorkspace(db) })));
+
+  r.post('/workspace/recover', asyncRoute(async (req, res) => {
+    const existing = await getWorkspace(db);
+    if (existing) return res.json({ workspace: existing, recovered: false });
+    const [owner] = await db.query<{ username: string; display_name: string | null }>(
+      `select username, display_name from users where role = 'super_admin' limit 1`,
+    );
+    const [deployment] = await db.query<{ domain: string | null }>(
+      `select domain from deployment_config where id = true`,
+    );
+    await ensureWorkspace(db, { name: owner?.display_name || owner?.username || 'My workspace' });
+    if (deployment?.domain) await updateWorkspace(db, { settings: { publicAddress: deployment.domain } });
+    await appendEvent(db, {
+      actorUserId: req.user!.id, actor: 'super_admin', kind: 'workspace.recovered',
+      subjectType: 'workspace', payload: { source: 'existing setup data' },
+    });
+    return res.status(201).json({ workspace: await getWorkspace(db), recovered: true });
+  }));
+
+  r.patch(
+    '/workspace',
+    asyncRoute(async (req, res) => {
+      const { name, timezone, settings } = (req.body ?? {}) as Record<string, unknown>;
+      const workspace = await updateWorkspace(db, {
+        name: typeof name === 'string' ? name : undefined,
+        timezone: typeof timezone === 'string' ? timezone : undefined,
+        settings: settings && typeof settings === 'object' ? (settings as Record<string, unknown>) : undefined,
+      });
+      await appendEvent(db, {
+        actorUserId: req.user!.id,
+        actor: 'super_admin',
+        kind: 'workspace.updated',
+        payload: { fields: Object.keys(req.body ?? {}) },
+      });
+      return res.json({ workspace });
+    }),
+  );
+
+  // ----------------------------------------------------------------- users
+  r.get('/users', asyncRoute(async (_req, res) => res.json({ users: await listUsers(db) })));
+
+  /** Invites a member. CE has no self-signup: every account is created here.
+   *
+   * The role is forced to `member`. A second super admin is impossible at the
+   * database level anyway, but refusing it here means the API says something
+   * useful instead of surfacing a constraint violation. */
+  r.post(
+    '/users',
+    asyncRoute(async (req, res) => {
+      const { email, username, displayName } = (req.body ?? {}) as Record<string, string>;
+      if (!email || !username) return res.status(400).json({ error: 'email and username required' });
+
+      let user;
+      try {
+        user = await createUser(db, { email, username, displayName, role: 'member' });
+      } catch (err) {
+        if (err instanceof UserError) return res.status(409).json({ error: err.message });
+        throw err;
+      }
+      const { token } = await issueAuthToken(db, { userId: user.id, purpose: 'invite' });
+      const link = `${ctx.appUrl}/set-password?token=${token}`;
+      await appendEvent(db, {
+        actorUserId: req.user!.id,
+        actor: 'super_admin',
+        kind: 'user.invited',
+        subjectType: 'user',
+        subjectId: user.id,
+      });
+      // Mail is Phase 8. Until then the link is returned so an operator can
+      // hand it over — which is why this endpoint is super-admin gated.
+      return res.status(201).json({ user, inviteLink: link });
+    }),
+  );
+
+  r.patch(
+    '/users/:userId',
+    asyncRoute(async (req, res) => {
+      const { email, username, displayName, status } = (req.body ?? {}) as Record<string, string>;
+      // Whether this person may let Josi control the PCs they sign in on.
+      const pcControlAllowed = (req.body ?? {}).pcControlAllowed;
+      if (pcControlAllowed !== undefined && typeof pcControlAllowed !== 'boolean') {
+        return res.status(400).json({ error: 'pcControlAllowed must be true or false' });
+      }
+      // The super admin cannot disable themselves and lock the installation.
+      if (param(req, 'userId') === req.user!.id && status === 'disabled') {
+        return res.status(409).json({ error: 'you cannot disable your own account' });
+      }
+      try {
+        const user = await updateUser(db, param(req, 'userId'), {
+          email, username, displayName,
+          status: status as 'active' | 'disabled' | undefined,
+          pcControlAllowed,
+        });
+        await appendEvent(db, {
+          actorUserId: req.user!.id,
+          actor: 'super_admin',
+          kind: 'user.updated',
+          subjectType: 'user',
+          subjectId: user.id,
+          payload: { fields: Object.keys(req.body ?? {}) },
+        });
+        return res.json({ user });
+      } catch (err) {
+        if (err instanceof UserError) return res.status(409).json({ error: err.message });
+        throw err;
+      }
+    }),
+  );
+
+  r.post(
+    '/users/:userId/reset-link',
+    asyncRoute(async (req, res) => {
+      const rows = await db.query<{ id: string }>(`select id from users where id = $1`, [param(req, 'userId')]);
+      if (!rows.length) return res.status(404).json({ error: 'no such user' });
+      const { token } = await issueAuthToken(db, { userId: rows[0].id, purpose: 'reset' });
+      await appendEvent(db, {
+        actorUserId: req.user!.id,
+        actor: 'super_admin',
+        kind: 'auth.reset_issued_by_admin',
+        subjectType: 'user',
+        subjectId: rows[0].id,
+      });
+      return res.json({ ok: true, link: `${ctx.appUrl}/set-password?token=${token}` });
+    }),
+  );
+
+  // -------------------------------------------------------------- sessions
+  r.get('/sessions', asyncRoute(async (_req, res) => res.json({ sessions: await listActiveSessions(db) })));
+
+  r.delete(
+    '/sessions/:sessionId',
+    asyncRoute(async (req, res) => {
+      await revokeSession(db, param(req, 'sessionId'));
+      await appendEvent(db, {
+        actorUserId: req.user!.id, actor: 'super_admin', kind: 'session.revoked',
+        subjectType: 'session', subjectId: param(req, 'sessionId'),
+      });
+      return res.json({ ok: true });
+    }),
+  );
+
+  r.delete(
+    '/users/:userId/sessions',
+    asyncRoute(async (req, res) => {
+      const n = await revokeAllSessions(db, param(req, 'userId'));
+      await appendEvent(db, {
+        actorUserId: req.user!.id, actor: 'super_admin', kind: 'session.revoked_all',
+        subjectType: 'user', subjectId: param(req, 'userId'), payload: { count: n },
+      });
+      return res.json({ ok: true, revoked: n });
+    }),
+  );
+
+  // ------------------------------------------------------------- audit log
+  r.get(
+    '/events',
+    asyncRoute(async (req, res) => {
+      const events = await listEvents(db, {
+        kind: typeof req.query.kind === 'string' ? req.query.kind : undefined,
+        limit: Number(req.query.limit) || 100,
+      });
+      return res.json({ events });
+    }),
+  );
+
+  // Kept for the invite flow above; exported here so the import is used even
+  // when mail is not yet wired.
+  void generatePassword;
+  return r;
+}

@@ -1,0 +1,111 @@
+Josi CE Server Setup — native Apple Silicon acceptance
+Requires arm64 and macOS 14+. This candidate is not yet SOCAL-signed/notarized.
+Unsigned package tests do not establish physical installation acceptance.
+
+ONE-STEP INSTALLER (AFTER SEPARATE SIGNING/PHYSICAL TEST AUTHORIZATION)
+Double-click Josi CE Server Setup.app and choose Install Josi CE Server. Approve
+macOS administrator authorization. Installation may take several minutes. The
+spinner/elapsed counter must keep moving, with current phase/service displayed.
+Open Josi hands setup to the default HTTP browser through a private one-use link.
+Verify package requires no elevation and installs/starts nothing.
+
+EVERY INSTALLED LAUNCHD LABEL — SYSTEM DOMAIN; NO SCANNER SERVICE
+com.heyjosi.ce.database       _josice_db       Boot; PostgreSQL/SCRAM readiness
+com.heyjosi.ce.web            _josice_web      Boot; waits for DB and migrations
+com.heyjosi.ce.worker         _josice_worker   Boot; DB/migrations; heartbeat
+com.heyjosi.ce.proxy          _josice_proxy    Boot; readiness waits for API
+com.heyjosi.ce.voice-control  _josice_control  Boot; authenticated speech control
+com.heyjosi.ce.voice          _josice_voice    Boot; authenticated transport
+All are distinct hidden non-login identities; no server runs as root. CPU speech
+models follow saved enablement, initially enabled. Disabling Voice Box unloads
+models while leaving its protected transport running. Root/launchd authority is
+not delegated to web, worker or speech.
+
+SIMPLE READ-ONLY STATUS COMMAND
+"/path/to/Josi CE Server Setup.app/Contents/MacOS/josi-native-status"
+Reports every label, expected startup, running state and PID. Exit 1 means a
+required job is absent/not running; exit 2 means inspection failed. A PID alone
+is not health. Also run:
+  /usr/bin/curl --fail --max-time 5 http://localhost:8080/ready
+One job: /bin/launchctl print system/com.heyjosi.ce.web
+Do not share raw launchctl output, private logs or transaction directories.
+Build-host observation: all six labels are NOT REGISTERED; live service health
+is not applicable. This run exercised isolated child processes only.
+
+DEFAULT LISTENERS — IPv4 127.0.0.1 ONLY
+15432 PostgreSQL; 18080 API; 8080 browser proxy; 18081 speech; 18082 control.
+Worker: no listener. PostgreSQL: no Unix socket. Caddy admin/automatic HTTPS: off.
+No wildcard/LAN listener, scanner port, Docker endpoint or model downloader.
+Inspect: sudo /usr/sbin/lsof -nP -iTCP -sTCP:LISTEN
+Match PIDs with the status utility; other applications' listeners are unrelated.
+
+HUMAN POST-INSTALL CHECKLIST
+[ ] Check archive SHA-256, SOCAL identity/team LRH75YR6QW and actual Gatekeeper
+    verdict. No notarization claim is made by this build.
+[ ] Observe live phase/service, spinner and elapsed time. Frozen UI, premature
+    success, or a credential in UI/log/command line fails acceptance.
+[ ] All six jobs run, /ready is HTTP 200, and worker heartbeat is recent:
+    sudo /usr/bin/stat -f '%Sm' "/Library/Application Support/Josi CE Server/data/state/worker-heartbeat"
+[ ] Only the five loopback listeners exist. Test access from a different LAN
+    machine separately; this build does not claim LAN acceptance.
+[ ] Default browser opens setup; the handoff fragment disappears and replay
+    fails. Complete ownership/vault recovery and normal sign-in in the browser.
+    Keep recovery material privately, outside the installer and source control.
+[ ] Setup has no required-scanner warning. Upload and extract a harmless
+    document, index/search it, and test OCR without a separate scanner.
+[ ] Enable/disable/restart CPU speech. Separately test microphone permission,
+    real recording and speaker output; synthesized test audio is not this gate.
+[ ] Reboot the physical test Mac, then repeat readiness/listener/status checks.
+[ ] Inspect root-owned programs/config/secrets, per-service secret groups and
+    web/worker data ACLs. Unrelated local users cannot read protected secrets.
+
+DOCUMENT PROCESSING — NO SEPARATE SCANNER REQUIRED
+macOS document uploads, indexing and OCR use the bundled document engines.
+Old scannerSocket configuration is tolerated for upgrade compatibility but is
+not passed to the application or used to gate document processing. Existing
+legacy ClamAV policy flags do not require a scanner on native macOS.
+No scanner service, account, engine, definitions or updater is installed.
+File ownership/access, file-type/size limits, quotas, encryption handling and
+archive expansion limits still apply. OCR language data is bundled for offline
+use. Image OCR is part of document indexing; chat photos use model vision.
+
+CLEAN INSTALL — SEPARATE PHYSICAL PROCEDURE, NOT PERFORMED HERE
+Use a separately authorized disposable Mac with no existing product root, labels
+or service accounts. First inventory all existing Josi apps/data/Keychains; never
+delete them to make acceptance pass. Run the signed installer and complete every
+check above. Ownership, account and port collisions must preserve unrelated data.
+
+UPGRADE — SEPARATE PHYSICAL PROCEDURE, NOT PERFORMED HERE
+Start with a separately accepted native macOS baseline of a different version
+and representative users, documents, conversations, settings and credentials.
+Make an independently verified private backup. Run the newer installer. Confirm
+quiescence, verified cold snapshot, migrations-before-writers and preserved data.
+Compare login/data behavior, reboot, then repeat the checklist. Same-version
+installation performs a retained-data repair. PostgreSQL major-version conversion is not implicit;
+this candidate uses major 16. Isolated child-process upgrade tests are not this
+physical upgrade procedure and do not authorize changing an existing installation.
+
+RECOVERY
+Private data, keys and logs: /Library/Application Support/Josi CE Server/data.
+Immutable journals/cold snapshots: transactions in that product root. Programs:
+versions/<version>. Never remove failed data, snapshots, identities, keys, old
+programs or incomplete journals. Before migration, recovery restarts the intact
+previous installation. After migration but before activation, it verifies the
+cold snapshot, retains failed data, then restores the previous version. Once
+activation begins, automatic rollback is refused to protect newer writes. Rerunning
+the package automatically upgrades or repairs that current data after verifying
+its version, ownership, service definitions and transaction records. Before
+activation, package recovery restores a verified snapshot or retains incomplete
+fresh provisioning and retries. Empty owned transaction directories can be
+removed; databases, user folders, snapshots and failed-data copies are retained.
+Ambiguous or damaged records still require lossless review.
+The fixed root-only helper supports `recover <32-hex transaction ID>`, using the
+trusted installed private Python (-I -B) and app/native/lifecycle.py. Review the
+transaction first; never elevate a helper from an untrusted download.
+
+CLAIMS OF THIS RUN
+No live installation, launchd registration, account creation, existing Josi
+modification, physical clean install/upgrade, reboot, microphone or speaker test.
+Headless browser and CPU inference results concern isolated packaged tests only.
+SOCAL signing, signature/timestamp/hardened-runtime checks, notarization,
+Gatekeeper acceptance and physical acceptance remain separate gates.

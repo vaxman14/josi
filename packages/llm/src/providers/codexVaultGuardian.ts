@@ -1,0 +1,277 @@
+// Private executable entry point, never imported by the API. Owns a single
+// temporary CLI home and process group. Parent disconnect or missing authority
+// heartbeat stops the group before its projection is read back and removed.
+import { spawn, type ChildProcess } from 'node:child_process';
+import { constants } from 'node:fs';
+import { lstat, mkdir, open, realpath, rm, type FileHandle } from 'node:fs/promises';
+import { join, isAbsolute } from 'node:path';
+import { performance } from 'node:perf_hooks';
+import { joinNewWindowsProcessJob, privateTemporaryDirectory, Secret, validateClaudeSubscriptionToken, validateCodexAuthCache,
+  type WindowsProcessJob } from '@josi-ce/core';
+import type { CodexGuardianInput, CodexGuardianOutput, CodexGuardianStart } from './codexVaultWire.js';
+import { requireCompatibleCodexHost } from './codexVaultCompatibility.js';
+import { requireCompatibleClaudeHost } from './claudeVaultCompatibility.js';
+import { validClaudeSubscriptionArgs } from './claudeVaultPolicy.js';
+
+// POSIX owns a process group. Windows owns a Job Object that this guardian
+// joins before it starts anything, so every consumer descendant is inside it
+// and the job kills them all if the guardian itself disappears.
+if (!process.send) process.exit(1);
+const consumer = process.env.JOSI_SUBSCRIPTION_CONSUMER;
+if (consumer !== 'codex' && consumer !== 'claude') process.exit(1);
+const windows = process.platform === 'win32';
+let job: WindowsProcessJob | undefined;
+if (windows) {
+  try { job = joinNewWindowsProcessJob(); } catch { process.exit(1); }
+}
+const compatible = () => consumer === 'codex' ? requireCompatibleCodexHost() : requireCompatibleClaudeHost();
+
+const send = (value: CodexGuardianOutput) => {
+  if (process.connected) process.send!(value, () => {});
+};
+// Input carries base64 images on image turns (Claude stream-json), so it is
+// bounded like the Codex private image files rather than like plain prompts.
+const MAX_OUTPUT = 4 * 1024 * 1024, MAX_INPUT = 24 * 1024 * 1024;
+let child: ChildProcess | undefined, directory: string | undefined;
+let directoryHandle: FileHandle | undefined;
+let group: number | undefined, started = false, finalizing = false, cancelled = false, timedOut = false;
+let spawnError = false, exitCode: number | null = null, childClosed = false;
+let stdout = '', stderr = '', outputBytes = 0;
+let claudeToken: Secret | undefined;
+let authorityMono = performance.now(), authorityWall = Date.now();
+let operationMono = performance.now(), operationWall = Date.now(), duration = 5_000;
+const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+
+function groupExists(): boolean {
+  if (windows) {
+    // An unanswerable query is not evidence of closure.
+    try { return job!.others() > 0; } catch { return true; }
+  }
+  if (!group) return false;
+  try { process.kill(-group, 0); return true; }
+  catch (err) { return (err as NodeJS.ErrnoException).code !== 'ESRCH'; }
+}
+function signalGroup(signal: NodeJS.Signals) {
+  if (windows) {
+    // Windows has no group-wide TERM; both phases end every job member.
+    try { job!.terminateOthers(); } catch { /* absence is checked separately */ }
+    return;
+  }
+  if (!group) return;
+  try { process.kill(-group, signal); } catch { /* absence is checked separately */ }
+}
+async function privateDirectoryStillCurrent(): Promise<boolean> {
+  if (!directory || !directoryHandle) return false;
+  if (windows) {
+    // The folder was created with a protected owner/SYSTEM/Administrators
+    // DACL. Confirm it is still that same folder, not a junction or swap.
+    const [held, current] = await Promise.all([directoryHandle.stat({ bigint: true }), lstat(directory, { bigint: true })]);
+    return current.isDirectory() && !current.isSymbolicLink() && held.dev === current.dev && held.ino === current.ino
+      && (await realpath(directory)).toLowerCase() === directory.toLowerCase();
+  }
+  const [held, current] = await Promise.all([directoryHandle.stat(), lstat(directory)]);
+  return current.isDirectory() && !current.isSymbolicLink() && held.dev === current.dev && held.ino === current.ino
+    && current.uid === process.getuid!() && (current.mode & 0o777) === 0o700
+    && await realpath(directory) === directory;
+}
+async function readCache(): Promise<string | null> {
+  let file: FileHandle | undefined;
+  try {
+    if (!await privateDirectoryStillCurrent()) return null;
+    file = await open(join(directory!, 'auth.json'), constants.O_RDONLY | constants.O_NOFOLLOW);
+    const before = await file.stat();
+    if (!before.isFile() || before.nlink !== 1 || before.size <= 0 || before.size > 64 * 1024
+      || !windows && (before.uid !== process.getuid!() || (before.mode & 0o777) !== 0o600)) return null;
+    // A bounded fd read never follows a replaced pathname or allocates from an
+    // attacker-controlled file size. The entire process group is already gone.
+    const bytes = Buffer.alloc(64 * 1024 + 1);
+    try {
+      const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
+      const after = await file.stat();
+      if (bytesRead !== before.size || after.size !== before.size || before.mtimeMs !== after.mtimeMs
+        || before.ctimeMs !== after.ctimeMs || !await privateDirectoryStillCurrent()) return null;
+      return validateCodexAuthCache(new Secret(bytes.subarray(0, bytesRead).toString('utf8'))).reveal();
+    } finally { bytes.fill(0); }
+  } catch { return null; }
+  finally { await file?.close().catch(() => {}); }
+}
+async function finish() {
+  if (finalizing) return;
+  finalizing = true;
+  clearInterval(watchdog);
+  // The CLI can leave an MCP descendant after its own exit. Keeping the
+  // credential claim until the whole owned group is gone prevents overlap.
+  signalGroup('SIGTERM');
+  const termDeadline = performance.now() + 750;
+  while (groupExists() && performance.now() < termDeadline) await sleep(50);
+  signalGroup('SIGKILL');
+  const killDeadline = performance.now() + 5_000;
+  while ((!childClosed || groupExists()) && performance.now() < killDeadline) await sleep(50);
+  if (!childClosed || groupExists()) {
+    send({ type: 'result', code: exitCode, stdout: '', stderr: '', timedOut, cancelled,
+      spawnError, stopped: false, cleaned: false, auth: null });
+    // Do not claim cleanup or delete a home still in use. A stuck kernel task
+    // keeps the Vault claim unresolved. Continue cleanup after the caller leaves.
+    while (!childClosed || groupExists()) { signalGroup('SIGKILL'); await sleep(1_000); }
+  }
+  const auth = consumer === 'codex' ? await readCache() : null;
+  let cleaned = false;
+  try {
+    if (directory) {
+      if (!await privateDirectoryStillCurrent()) throw new Error();
+      // Windows cannot fully remove a folder this process still holds open.
+      if (windows) { await directoryHandle?.close(); directoryHandle = undefined; }
+      await rm(directory, { recursive: true, force: false });
+    }
+    cleaned = true;
+  } catch { /* caller must not mark the projection ready */ }
+  await directoryHandle?.close().catch(() => {});
+  if (claudeToken) {
+    // Accumulate before redaction so a credential split across output chunks
+    // cannot escape into a model response, error, event or ordinary log.
+    for (const text of [claudeToken.reveal(), JSON.stringify(claudeToken.reveal()).slice(1, -1)]) {
+      stdout = stdout.split(text).join('[subscription credential removed]');
+      stderr = stderr.split(text).join('[subscription credential removed]');
+    }
+    claudeToken = undefined;
+  }
+  send({ type: 'result', code: exitCode, stdout, stderr, timedOut, cancelled,
+    spawnError, stopped: true, cleaned, auth });
+  // Flush the private result before disconnecting. No stdout/stderr is used.
+  if (process.connected) process.disconnect();
+}
+function stop() {
+  cancelled = true;
+  signalGroup('SIGTERM');
+  if (child) void finish();
+  else if (!started) { childClosed = true; void finish(); }
+  // A stop during directory creation is handled before spawn below.
+}
+function validStart(value: CodexGuardianStart): boolean {
+  return typeof value.command === 'string' && isAbsolute(value.command) && !value.command.includes('\0')
+    && Array.isArray(value.args) && value.args.length <= 100
+    && value.args.every(a => typeof a === 'string' && a.length <= 16_384 && !a.includes('\0'))
+    // The caller may select model/harness options, never redirect auth storage,
+    // endpoints or API credentials through a later command-line override.
+    && (consumer === 'claude' ? value.auth !== null && validClaudeSubscriptionArgs(value.args)
+      : !value.args.some(a => /cli_auth_credentials_store|forced_login_method|chatgpt_base_url|model_provider|openai_base_url|api_key|auth\.json/i.test(a)))
+    && typeof value.input === 'string' && Buffer.byteLength(value.input) <= MAX_INPUT
+    && (value.privateFiles === undefined || consumer === 'codex' && Array.isArray(value.privateFiles)
+      && value.privateFiles.length <= 11
+      && new Set(value.privateFiles.map(file => file?.name)).size === value.privateFiles.length
+      && value.privateFiles.every(file => file && typeof file.name === 'string'
+        && /^josi-(response\.schema\.json|image-\d+\.(png|jpg|webp|gif))$/.test(file.name)
+        && typeof file.base64 === 'string' && file.base64.length <= 8 * 1024 * 1024
+        && Buffer.from(file.base64, 'base64').toString('base64') === file.base64)
+      && value.privateFiles.reduce((size, file) => size + file.base64.length, 0) <= 24 * 1024 * 1024)
+    && (value.auth === null || typeof value.auth === 'string' && Buffer.byteLength(value.auth) <= 64 * 1024)
+    && Number.isSafeInteger(value.timeoutMs) && value.timeoutMs > 0 && value.timeoutMs <= 15 * 60_000;
+}
+async function start(value: CodexGuardianStart) {
+  if (started || finalizing || !validStart(value)) { stop(); return; }
+  started = true;
+  operationMono = performance.now(); operationWall = Date.now(); duration = value.timeoutMs;
+  try {
+    compatible();
+    // Canonicalize only the fresh Josi-created empty directory. Never search a
+    // user's home, existing Codex directory, Keychain or browser profile.
+    directory = await realpath(privateTemporaryDirectory(`josi-${consumer}-vault-`));
+    directoryHandle = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    if (consumer === 'claude') claudeToken = validateClaudeSubscriptionToken(new Secret(value.auth!));
+    else if (value.auth !== null) {
+      const cache = validateCodexAuthCache(new Secret(value.auth));
+      const file = await open(join(directory, 'auth.json'),
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+      try { await file.writeFile(cache.reveal(), 'utf8'); await file.sync(); }
+      finally { await file.close(); }
+    }
+    value.auth = null;
+    await mkdir(join(directory, 'work'), { mode: 0o700 });
+    // Captures and schemas live with the supervised process group. Parent
+    // death still removes them after consumer closure; no parent temp cache.
+    for (const asset of value.privateFiles ?? []) {
+      const bytes = Buffer.from(asset.base64, 'base64');
+      const file = await open(join(directory, 'work', asset.name),
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+      try { await file.writeFile(bytes); }
+      finally { bytes.fill(0); await file.close(); asset.base64 = ''; }
+    }
+    value.privateFiles = undefined;
+    if (cancelled || !process.connected || !await privateDirectoryStillCurrent()) throw new Error();
+    const env: NodeJS.ProcessEnv = {
+      PATH: process.env.PATH, LANG: 'en_US.UTF-8', NO_COLOR: '1', CI: '1',
+      HOME: directory, TMPDIR: directory, TMP: directory, TEMP: directory,
+      XDG_CONFIG_HOME: directory, XDG_CACHE_HOME: directory, XDG_DATA_HOME: directory,
+    };
+    if (windows) {
+      // Windows CLIs resolve their profile from these, not HOME. All point
+      // into the private folder; system folders are kept so the vendors'
+      // managed-policy locations are still honoured, never bypassed.
+      for (const key of ['SystemRoot', 'windir', 'ProgramData', 'ProgramFiles', 'ProgramW6432']) {
+        if (process.env[key]) env[key] = process.env[key];
+      }
+      env.PATHEXT = '.COM;.EXE';
+      env.USERPROFILE = directory;
+      env.APPDATA = join(directory, 'AppData', 'Roaming');
+      env.LOCALAPPDATA = join(directory, 'AppData', 'Local');
+      await mkdir(env.APPDATA, { recursive: true });
+      await mkdir(env.LOCALAPPDATA, { recursive: true });
+    }
+    if (consumer === 'claude') {
+      env.CLAUDE_CONFIG_DIR = directory;
+      env.CLAUDE_CODE_OAUTH_TOKEN = claudeToken!.reveal();
+      env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1';
+    } else env.CODEX_HOME = directory;
+    child = spawn(value.command, consumer === 'codex' ? [
+      '-c', 'cli_auth_credentials_store="file"', '-c', 'forced_login_method="chatgpt"', ...value.args,
+    ] : value.args, { env, cwd: join(directory, 'work'), detached: !windows, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    delete env.CLAUDE_CODE_OAUTH_TOKEN;
+    group = child.pid;
+    const absorb = (stream: 'stdout' | 'stderr', text: string) => {
+      outputBytes += Buffer.byteLength(text, 'utf8');
+      if (outputBytes > MAX_OUTPUT) { stop(); return; }
+      if (stream === 'stdout') stdout += text; else stderr += text;
+      if (consumer === 'codex' && value.args[0] === 'login') send({ type: 'output', text });
+    };
+    child.stdout!.setEncoding('utf8');
+    child.stderr!.setEncoding('utf8');
+    child.stdout!.on('data', (chunk: string) => absorb('stdout', chunk));
+    child.stderr!.on('data', (chunk: string) => absorb('stderr', chunk));
+    child.on('error', () => { spawnError = true; });
+    child.on('close', code => { childClosed = true; exitCode = code; void finish(); });
+    child.stdin!.on('error', () => {});
+    child.stdin!.end(value.input);
+    value.input = '';
+    if (cancelled) void finish();
+  } catch {
+    value.auth = null; value.input = '';
+    spawnError = true;
+    if (!child) childClosed = true;
+    void finish();
+  }
+}
+// The parent renews about once a second, and each renewal is several database
+// round trips. Fifteen seconds tolerates a slow second (a cold database right
+// after a restart) without letting a dead parent keep the login for long.
+const AUTHORITY_WINDOW_MS = 15_000;
+const watchdog = setInterval(() => {
+  const mono = performance.now(), wall = Date.now();
+  if (mono - authorityMono > AUTHORITY_WINDOW_MS || wall - authorityWall > AUTHORITY_WINDOW_MS || wall < authorityWall
+    || !started && mono - operationMono > AUTHORITY_WINDOW_MS) stop();
+  if (started && (mono - operationMono > duration || wall - operationWall > duration || wall < operationWall)) {
+    timedOut = true; stop();
+  }
+}, 250);
+process.on('message', (raw: CodexGuardianInput) => {
+  if (!raw || typeof raw !== 'object') { stop(); return; }
+  if (raw.type === 'start') void start(raw);
+  else if (raw.type === 'renew' && !cancelled && !finalizing) {
+    try { compatible(); } catch { stop(); return; }
+    authorityMono = performance.now(); authorityWall = Date.now();
+  } else if (raw.type === 'stop') stop();
+  else stop();
+});
+process.on('disconnect', stop);
+process.on('SIGTERM', stop);
+process.on('SIGINT', stop);
+send({ type: 'ready' });

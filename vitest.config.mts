@@ -1,0 +1,44 @@
+import { defineConfig } from 'vitest/config';
+import { realpathSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+// macOS's temp folder sits behind the /var symlink, and storage that refuses
+// symlinked roots is right to refuse it, so the suite is given the real path.
+const scratch = realpathSync(tmpdir());
+
+export default defineConfig({
+  test: {
+    // Each suite spins its own in-memory Postgres; running them in one process
+    // keeps memory sane on the low-end hardware CE targets.
+    // PGlite/WASM teardown in worker threads crashes Node on Windows (0xC0000005).
+    // Keep the same serial suites, isolated in processes on Windows instead.
+    pool: process.platform === 'win32' ? 'forks' : 'threads',
+    maxWorkers: 1,
+    fileParallelism: false,
+    testTimeout: 30_000,
+    hookTimeout: 60_000,
+    include: ['packages/**/test/**/*.test.ts', 'apps/**/test/**/*.test.ts'],
+    // Stands in for /data, which only exists inside the image.
+    env: { TMPDIR: scratch, JOSI_TEST_DATA_DIR: join(scratch, `josi-test-data-${process.pid}`) },
+  },
+  resolve: {
+    alias: {
+      '@josi-ce/tunnel/node': fileURLToPath(new URL('./packages/tunnel/src/node.ts', import.meta.url)),
+      '@josi-ce/tunnel': fileURLToPath(new URL('./packages/tunnel/src/index.ts', import.meta.url)),
+      '@josi-ce/protocol': fileURLToPath(new URL('./packages/protocol/src/index.ts', import.meta.url)),
+      '@': fileURLToPath(new URL('./apps/web/src', import.meta.url)),
+      '@josi-ce/core': fileURLToPath(new URL('./packages/core/src/index.ts', import.meta.url)),
+      '@josi-ce/auth': fileURLToPath(new URL('./packages/auth/src/index.ts', import.meta.url)),
+      '@josi-ce/llm': fileURLToPath(new URL('./packages/llm/src/index.ts', import.meta.url)),
+      '@josi-ce/agent': fileURLToPath(new URL('./packages/agent/src/index.ts', import.meta.url)),
+      '@josi-ce/connectors': fileURLToPath(new URL('./packages/connectors/src/index.ts', import.meta.url)),
+      '@josi-ce/mail': fileURLToPath(new URL('./packages/mail/src/index.ts', import.meta.url)),
+      '@josi-ce/channels': fileURLToPath(new URL('./packages/channels/src/index.ts', import.meta.url)),
+      '@josi-ce/storage': fileURLToPath(new URL('./packages/storage/src/index.ts', import.meta.url)),
+      '@josi-ce/ops': fileURLToPath(new URL('./packages/ops/src/index.ts', import.meta.url)),
+      '@josi-ce/persona': fileURLToPath(new URL('./packages/persona/src/index.ts', import.meta.url)),
+    },
+  },
+});

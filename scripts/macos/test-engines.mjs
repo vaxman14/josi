@@ -1,0 +1,22 @@
+// Exercise the packaged extraction path with native macOS settings and no scanner.
+import assert from 'node:assert/strict';
+import {createRequire} from 'node:module';
+import {dirname,resolve,join} from 'node:path';
+import {writeFileSync,readFileSync} from 'node:fs';
+import {execFileSync} from 'node:child_process';
+import {pathToFileURL} from 'node:url';
+const root=process.argv[2];assert(root.startsWith('/Users/roman/Documents/Josi Mac Native/JosiDrive/BuildTemp/josi-ce-native-macos-20261009/tmp/port/tests/')||root.startsWith(`/private/tmp/josi-ce-native-tests-${process.getuid()}/`));
+assert.equal(JSON.parse(readFileSync(join(root,'data/isolated-test.json'))).purpose,'disposable-native-acceptance');
+const program=resolve(dirname(process.execPath),'../..'),require=createRequire(join(program,'app/package.json'));
+const {hash,verify}=require('@node-rs/argon2');assert(await verify(await hash('isolated synthetic acceptance input'),'isolated synthetic acceptance input'));
+const {createCanvas}=require('@napi-rs/canvas'),canvas=createCanvas(1200,160),ctx=canvas.getContext('2d');
+ctx.fillStyle='white';ctx.fillRect(0,0,1200,160);ctx.fillStyle='black';ctx.font='64px Helvetica';ctx.fillText('NATIVE OCR 314159',30,100);
+const bytes=canvas.toBuffer('image/png'),png=join(root,'engine-fixture.png'),heic=join(root,'engine-fixture.heic');writeFileSync(png,bytes,{mode:0o600});
+const {extractRichSegments}=await import(pathToFileURL(join(program,'app/packages/storage/dist/extract.js')));
+process.env.JOSI_NATIVE_RUNTIME='1';process.env.JOSI_SCANNER_SOCKET='';
+const segments=await extractRichSegments({extension:'png',bytes,ocrImages:true});
+assert.match(segments.map(s=>s.content).join('\n'),/OCR 314159/);
+assert.match((await extractRichSegments({extension:'txt',bytes:Buffer.from('native document 271828')}))[0].content,/271828/);
+execFileSync('/usr/bin/sips',['-s','format','heic',png,'--out',heic],{stdio:'pipe'});
+const convert=require('heic-convert');const converted=Buffer.from(await convert({buffer:readFileSync(heic),format:'PNG'}));assert.equal(converted.subarray(1,4).toString(),'PNG');
+console.log('PASS packaged arm64 Argon2/canvas, offline document extraction/OCR without a scanner, and HEIF conversion');

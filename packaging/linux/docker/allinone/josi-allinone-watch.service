@@ -1,0 +1,14 @@
+[Unit]
+Description=End the container if Ollama or Josi stops answering
+After=josi-firstboot.service
+
+[Service]
+ExecStart=/usr/local/sbin/josi-allinone-watch
+Restart=no
+FailureAction=exit
+SuccessAction=none
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,30 @@
+import Foundation
+
+enum InstallerState: Equatable {
+    case waiting, working, ready, failed, removed
+    var canOpen: Bool { self == .ready }
+    var canChangeFolder: Bool { self == .ready }
+    static func afterMaintenanceFailure(_ operation: String) -> InstallerState {
+        // A refused folder can be retried after the installed server proves
+        // readiness. Installation/recovery failures remain explicitly blocked.
+        operation == "workspace" ? .waiting : .failed
+    }
+    static func phase(_ raw: String, service: String = "") -> String {
+        let names = ["prepared":"Preparing Josi", "verified":"Installation files verified", "quiescing":"Pausing Josi", "quiesced":"Josi paused", "snapshot":"Saving a safety copy", "provisioned":"Preparing your settings", "database-ready":"Preparing your data", "migrating":"Updating your data", "migrated":"Your data is ready", "activating":"Starting Josi", "activated":"Starting Josi", "healthy":"Josi is ready", "committed":"Installation complete", "verifying":"Checking installation files", "recovery-required":"Installation stopped; your data is retained", "Copying and flushing protected files":"Copying Josi files", "Stopping services":"Pausing Josi", "Starting services":"Starting Josi", "Checking readiness":"Checking that Josi is ready"]
+        let services = ["database":"Data", "web":"Server", "worker":"Background tasks", "proxy":"Browser connection", "voice":"Voice", "voice-control":"Voice settings"]
+        if raw == "Checking readiness" {
+            return "Waiting for the server, background tasks and voice connection to become ready. Checks repeat for up to four minutes; a failure stops installation and retains your data."
+        }
+        let recovery = ["Keeping existing data for upgrade":"Keeping your data and preparing an upgrade", "Restoring the verified safety copy":"Restoring your verified safety copy", "Retrying incomplete setup":"Saving the incomplete setup and retrying", "Continuing installation":"Recovery complete; continuing installation", "Clearing empty installation records":"Cleaning up an interrupted setup"]
+        if let message = recovery[raw] { return message }
+        return (names[raw] ?? "Preparing Josi") + (services[service].map { " · " + $0 } ?? "")
+    }
+    static func from(_ event: [String: Any]) -> InstallerState {
+        switch event["result"] as? String {
+        case "success": return .ready
+        case "failure": return .failed
+        case "removed": return .removed
+        default: return .working
+        }
+    }
+}

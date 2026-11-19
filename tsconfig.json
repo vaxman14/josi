@@ -1,0 +1,53 @@
+{
+  "files": [],
+  "references": [
+    {
+      "path": "packages/protocol"
+    },
+    {
+      "path": "packages/tunnel"
+    },
+    {
+      "path": "packages/automation"
+    },
+    {
+      "path": "packages/core"
+    },
+    {
+      "path": "packages/auth"
+    },
+    {
+      "path": "packages/llm"
+    },
+    {
+      "path": "packages/agent"
+    },
+    {
+      "path": "packages/connectors"
+    },
+    {
+      "path": "packages/mail"
+    },
+    {
+      "path": "packages/storage"
+    },
+    {
+      "path": "packages/ops"
+    },
+    {
+      "path": "packages/persona"
+    },
+    {
+      "path": "packages/channels"
+    },
+    {
+      "path": "apps/api"
+    },
+    {
+      "path": "apps/worker"
+    },
+    {
+      "path": "apps/hosted"
+    }
+  ]
+}

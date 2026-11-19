@@ -1,0 +1,914 @@
+// Model configuration, capability probing, spending caps and usage.
+//
+// Two routers, split by what they are allowed to reveal:
+//
+//   * The admin router configures the installation. It never returns a key, a
+//     prompt, or a reply — only whether a key is set and what a probe observed.
+//   * The member router answers one question: what can Josi do for me right
+//     now, and how much of my own allowance is left. A member cannot see the
+//     provider's key, the workspace's other members' usage, or the caps of
+//     anyone but themselves.
+//
+// Every rule that decides whether a model may be called lives in
+// packages/llm/src/registry.ts, not here. A route is a bad place for a security
+// control: the next route forgets it.
+import { Router, type Request, type Response } from 'express';
+import {
+  appendEvent, asSecret, json, loadMasterKey, VaultError, VaultLockedError,
+  type Db, type LoadOptions, type MasterKey,
+} from '@josi-ce/core';
+import {
+  UnsafeEndpointError, buildProvider, capabilitiesOf, checkCaps, disabledFeatures, discoverModels,
+  isExternalProvider, isLocalOnly, isSubscriptionProvider, loadStoredProvider, meteredProvider,
+  loadModelContext, loadLastPrompt, promptProfile, backgroundModelWork, refreshModelContext,
+  llmDebugEnabled, llmDebugFile, LLM_DEBUG_FLAG_FILE,
+  probeProvider, usageSummary, validateEndpoint, LlmError, DEFAULT_CLAUDE_COMMAND,
+  DEFAULT_CODEX_COMMAND,
+  PROVIDERS, credentialFields, describeProvider, saveModelConfiguration, removeModelConfiguration, ModelConfigurationError,
+  type StoredProvider,
+} from '@josi-ce/llm';
+import { describeEdition, hasCapability } from '@josi-ce/core';
+import { asyncRoute, param } from './async.js';
+import { probeProgress, trackProbe } from './probeProgress.js';
+import { claudeSubscriptionRouter } from './claudeSubscriptionRoutes.js';
+import { codexSubscriptionRouter } from './codexSubscriptionRoutes.js';
+import { assertMetadataOnly, requireAuth, requireSuperAdmin } from './authz.js';
+
+export interface LlmRoutesCtx {
+  db: Db;
+  masterKey?: LoadOptions | false;
+  /** Injected in tests so no provider is ever contacted by the suite. */
+  fetchImpl?: typeof fetch;
+  resolve?: (hostname: string) => Promise<string[]>;
+  /** Injected in tests so no suite ever executes the Codex binary. */
+  codexRunner?: import('@josi-ce/llm').SpawnRunner;
+}
+
+class RouteError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
+}
+
+const str = (v: unknown, max = 500): string => (typeof v === 'string' ? v.trim().slice(0, max) : '');
+
+/** jsonb that should be a list, made into one no matter how it was stored. */
+function asArray(value: unknown): unknown[] {
+  if (Array.isArray(value)) return value;
+  if (typeof value === 'string') {
+    try {
+      const parsed: unknown = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+/** Every provider that is not gated behind an edition capability.
+ *
+ * Derived from the catalogue rather than typed out. The hand-maintained version
+ * of this array is why `anthropic_subscription` could be chosen in the UI
+ * before the database would accept it, and why the fix needed migration 0022.
+ * A provider added to `catalog.ts` is savable here the moment its migration
+ * lands, and a provider removed from it stops being savable everywhere at once. */
+const KNOWN_PROVIDERS = PROVIDERS
+  .filter((p) => p.wire !== 'cli')
+  .map((p) => p.kind as string);
+
+/** Providers that exist only on a build whose edition permits them.
+ *
+ * Kept out of `KNOWN_PROVIDERS` so a hosted build's provider list does not even
+ * mention them — and so `savableProviders()` below is the ONE place the two
+ * lists are joined. */
+export const CAPABILITY_PROVIDERS: Array<{ provider: string; capability: 'subscription_auth' }> = [
+  { provider: 'openai_subscription', capability: 'subscription_auth' },
+  { provider: 'anthropic_subscription', capability: 'subscription_auth' },
+];
+
+/** The catalogue as the admin form needs it.
+ *
+ * Everything here is metadata — labels, which fields to render, where requests
+ * go. No credential and nothing derived from one. The subscription entries are
+ * filtered by the edition capability for the same reason `savableProviders()`
+ * filters them: a hosted build should not confirm that the option exists
+ * somewhere, so the form never learns to draw it.
+ *
+ * Sent with the page rather than fetched separately, so the form cannot render
+ * a provider the server would then refuse to save. */
+export function providerCatalog(): Array<Record<string, unknown>> {
+  const gated = new Map(CAPABILITY_PROVIDERS.map((p) => [p.provider, p.capability]));
+  return PROVIDERS
+    .filter((p) => {
+      const capability = gated.get(p.kind);
+      return !capability || hasCapability(capability);
+    })
+    .map((p) => ({
+      kind: p.kind,
+      label: p.label,
+      external: p.external,
+      baseUrlMode: p.baseUrlMode,
+      defaultBaseUrl: p.defaultBaseUrl ?? null,
+      // The secret flag travels so the form knows to use a password field and
+      // to leave the value out of anything it echoes back.
+      fields: p.fields.map((f) => ({
+        key: f.key,
+        label: f.label,
+        secret: f.secret,
+        required: f.required,
+        placeholder: f.placeholder ?? null,
+        help: f.help ?? null,
+        choices: f.choices ?? null,
+      })),
+      discovery: p.discovery,
+      modelNoun: p.modelNoun ?? 'model',
+      residency: p.residency,
+      docsUrl: p.docsUrl,
+    }));
+}
+
+export function savableProviders(): string[] {
+  return [
+    ...KNOWN_PROVIDERS,
+    ...CAPABILITY_PROVIDERS.filter((p) => hasCapability(p.capability)).map((p) => p.provider),
+  ];
+}
+
+/** The credential fields for one provider, pulled out of a request body.
+ *
+ * Which fields exist, and which half each belongs in, is the catalogue's
+ * answer rather than this route's — so a provider that needs a region and a key
+ * pair is handled by the same code as one that needs an API key, and adding a
+ * provider does not mean editing this function.
+ *
+ * Secrets stay wrapped in `Secret` the whole way: `seal` unwraps them, and
+ * nothing here ever calls reveal(). */
+export function readCredentials(kind: string, body: Record<string, unknown>) {
+  const { secret, config } = credentialFields(kind);
+  const secrets: Record<string, ReturnType<typeof asSecret>> = {};
+  for (const field of secret) {
+    secrets[field.key] = asSecret(body[field.key]);
+  }
+  const settings: Record<string, string> = {};
+  for (const field of config) {
+    const value = str(body[field.key], 200);
+    // A picker's answer is one of its choices or it is nothing.
+    if (value && (!field.choices || field.choices.some((c) => c.value === value))) settings[field.key] = value;
+  }
+  return { secrets, settings, secretFields: secret, configFields: config };
+}
+
+/** Reveals the secrets for ONE listing call.
+ *
+ * Discovery has to present the credential to the provider, so there is no way
+ * around revealing it here. It is used for the request and nothing else — not
+ * stored, not logged, not echoed — which is the same contract the single
+ * `apiKey` path had before there were several. */
+export function revealForDiscovery(secrets: Record<string, ReturnType<typeof asSecret>>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(secrets)) {
+    if (!value.isEmpty) out[key] = value.reveal();
+  }
+  return out;
+}
+
+function requireMasterKey(ctx: LlmRoutesCtx): MasterKey {
+  if (ctx.masterKey === false) throw new RouteError(503, 'this installation cannot store secrets right now');
+  try {
+    return loadMasterKey(ctx.masterKey ?? {});
+  } catch {
+    // The loader's message names a filesystem path. The operator gets the
+    // actionable half without it.
+    throw new RouteError(
+      503,
+      'the installation master key is missing or unusable, so nothing can be saved securely.',
+    );
+  }
+}
+
+/**
+ * M83, revisited in Phase 13.3 after re-reading both providers' current terms.
+ *
+ * The August 2026 answer was "no compliant path exists" for all three, and half
+ * of that has changed. So the list is no longer a blanket refusal: each entry
+ * carries what is actually true of that provider today, with the reason and the
+ * date, and only the one with a real supported path is offered.
+ *
+ * Sources are recorded in `docs/SUBSCRIPTION_AUTH.md` rather than in a code
+ * comment nobody re-checks.
+ */
+export function subscriptionOptions(): Array<{
+  id: string; label: string; available: boolean; provider: string | null; reason: string;
+}> {
+  const ceOnly = hasCapability('subscription_auth');
+  return [
+    {
+      id: 'chatgpt_subscription',
+      label: 'Use my ChatGPT plan through the Codex CLI',
+      provider: 'openai_subscription',
+      available: ceOnly,
+      reason: ceOnly
+        ? 'Josi runs OpenAI\'s own Codex CLI with a subscription login saved in the Vault. '
+          + 'It is per installation rather than per person, it '
+          + 'shares your own Codex usage limits, and it reports no token counts or cost. Tools '
+          + 'work on this path once the model test confirms them.'
+        // The honest sentence for a build that is not CE. It names the reason
+        // as a licence boundary rather than implying a missing feature.
+        : 'OpenAI permits a personal ChatGPT plan to be used for individual productivity and not '
+          + 'to power a commercial service. This build is not a Community Edition installation, '
+          + 'so it cannot offer it.',
+    },
+    {
+      id: 'claude_subscription',
+      label: 'Use my Claude subscription through Claude Code',
+      provider: 'anthropic_subscription',
+      available: ceOnly,
+      reason: ceOnly
+        ? 'Josi runs Anthropic\'s own Claude Code CLI using a subscription setup token saved '
+          + 'in the Vault. Generate that token with Anthropic\'s official setup-token command. It is per installation '
+          + 'rather than per person, and it shares your own Claude usage limits. Tools work on '
+          + 'this path once the model test confirms them.'
+        : 'A personal Claude plan is licensed for an individual rather than for powering a '
+          + 'commercial service. This build is not a Community Edition installation, so it cannot '
+          + 'offer it. An Anthropic API key works on any build.',
+    },
+    // GitHub Copilot is deliberately NOT in this list any more. It used to
+    // appear as a permanently-unavailable entry; a choice that can never be
+    // chosen is noise, and the decision (2026-09-02) was to drop it entirely
+    // rather than keep explaining it.
+  ];
+}
+
+/** The non-secret settings for a provider, and nothing else.
+ *
+ * An allowlist, not a denylist: fields are kept because the catalogue says they
+ * are configuration, rather than dropped because their name looked like a
+ * credential. A field nobody declared does not come out. */
+export function publicConfig(
+  kind: string,
+  stored: Record<string, unknown> | null | undefined,
+): Record<string, unknown> {
+  if (!stored || typeof stored !== 'object') return {};
+  const out: Record<string, unknown> = {};
+  for (const field of credentialFields(kind).config) {
+    const value = stored[field.key];
+    if (typeof value === 'string' && value) out[field.key] = value;
+  }
+  return out;
+}
+
+interface ProviderDto {
+  role: 'primary' | 'fallback';
+  provider: string;
+  model: string;
+  baseUrl: string | null;
+  /** Whether a key is stored. Never the key, never its length or prefix. */
+  apiKeySet: boolean;
+  /** The non-secret settings — region, project, API version.
+   *
+   * Shown back on purpose. An operator has to be able to see which AWS region
+   * their conversations are being sent to, and a write-only region is a support
+   * conversation waiting to happen. Nothing sealed is ever in here: the split is
+   * declared per field in the catalogue, and `readCredentials` sorts by it. */
+  providerConfig: Record<string, unknown>;
+  external: boolean;
+  externalAcknowledged: boolean;
+  active: boolean;
+  probedAt: string | null;
+  capabilities: ReturnType<typeof capabilitiesOf>;
+  probeSteps: unknown;
+}
+
+async function providerDto(db: Db, role: 'primary' | 'fallback'): Promise<ProviderDto | null> {
+  const stored = await loadStoredProvider(db, role);
+  if (!stored) return null;
+  const [steps] = await db.query<{ probe_steps: unknown }>(
+    `select probe_steps from llm_providers where role = $1`,
+    [role],
+  );
+  const dto: ProviderDto = {
+    role,
+    provider: stored.provider,
+    model: stored.model,
+    baseUrl: stored.base_url,
+    apiKeySet: !!stored.api_key_enc,
+    // Projected through the catalogue rather than served as stored. Only the
+    // fields THIS provider declares non-secret come out, so a key that reached
+    // the column by any route other than `readCredentials` — a hand-edited row,
+    // a future bug — is dropped here instead of being handed to a screen.
+    providerConfig: publicConfig(stored.provider, stored.provider_config),
+    external: isExternalProvider(stored.provider),
+    externalAcknowledged: stored.external_acknowledged,
+    active: !!stored.activated_at,
+    probedAt: stored.probed_at,
+    capabilities: capabilitiesOf(stored),
+    // Normalised here as well: a row written before the fix above, or by any
+    // other means, must not reach a caller as something that is not a list.
+    probeSteps: asArray(steps?.probe_steps),
+  };
+  // Belt and braces: a careless `...stored` spread added later throws here
+  // rather than serialising the sealed key.
+  assertMetadataOnly(dto as unknown as Record<string, unknown>);
+  return dto;
+}
+
+// ------------------------------------------------------------------- admin
+
+export function adminLlmRoutes(ctx: LlmRoutesCtx): Router {
+  const r = Router();
+  const { db } = ctx;
+  r.use(requireSuperAdmin);
+
+  /** Turns the two expected refusals into responses an operator can act on, and
+   * lets anything unexpected reach the error handler — which says nothing at
+   * all, because an unexpected error's message is not ours to publish. */
+  const handle = (fn: (req: Request, res: Response) => Promise<unknown>) =>
+    asyncRoute(async (req: Request, res: Response) => {
+      try {
+        return await fn(req, res);
+      } catch (err: unknown) {
+        if (err instanceof RouteError || err instanceof ModelConfigurationError) return res.status(err.status).json({ error: err.message });
+        if (err instanceof VaultLockedError) return res.status(423).json({ error: err.message });
+        if (err instanceof VaultError) return res.status(409).json({ error: err.message });
+        if (err instanceof UnsafeEndpointError) return res.status(400).json({ error: err.message });
+        throw err;
+      }
+    });
+
+  r.get(
+    '/',
+    handle(async (_req, res) => {
+      const primary = await providerDto(db, 'primary');
+      const [caps] = await db.query(
+        `select monthly_cost_usd, monthly_tokens from llm_caps where id = true`,
+      );
+      const storedPrimary = await loadStoredProvider(db, 'primary');
+      return res.json({
+        primary,
+        // What the model's own server says it can take in, the size of the
+        // last chat request against it, and which prompt is in use. Sizes
+        // only: nothing here is the content of a request.
+        modelContext: await loadModelContext(db, storedPrimary),
+        lastPrompt: await loadLastPrompt(db, storedPrimary),
+        promptProfile: storedPrimary ? promptProfile(storedPrimary, await loadModelContext(db, storedPrimary)) : null,
+        backgroundModelWork: backgroundModelWork(storedPrimary),
+        debugLog: { on: llmDebugEnabled(), file: llmDebugFile(), flagFile: LLM_DEBUG_FLAG_FILE },
+        fallback: await providerDto(db, 'fallback'),
+        localOnly: await isLocalOnly(db),
+        // What CE will and will not do right now, with the reason attached.
+        disabledFeatures: disabledFeatures(primary?.capabilities ?? null),
+        caps,
+        providerCatalog: providerCatalog(),
+        subscriptionOptions: subscriptionOptions(),
+        // What this build is, so the screen can explain a refusal rather than
+        // showing a control that silently does nothing.
+        edition: describeEdition(),
+      });
+    }),
+  );
+
+  /** The debug view: the most recent model requests, one row each, with why
+   * it was made, how many tokens went in and came out, and how long it took.
+   * Counts and times from the usage table, which has no column for content. */
+  r.get(
+    '/requests',
+    handle(async (req, res) => {
+      const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 60));
+      const rows = await db.query<{ id: string; at: string; purpose: string | null; provider: string; model: string; role: string; input_tokens: number; output_tokens: number; latency_ms: number | null }>(
+        `select id::text, created_at as at, purpose, provider, model, role, input_tokens, output_tokens, latency_ms
+           from llm_usage order by id desc limit $1`, [limit]);
+      // Requests that belong to one chat message: consecutive chat requests
+      // with less than a minute between one ending and the next starting.
+      return res.json({ requests: rows.map((r) => ({
+        id: r.id, at: r.at, purpose: r.purpose ?? 'unknown', provider: r.provider, model: r.model, role: r.role,
+        inputTokens: r.input_tokens, outputTokens: r.output_tokens, latencyMs: r.latency_ms,
+        tokensPerSecond: r.latency_ms && r.latency_ms > 0 ? Math.round(((r.input_tokens + r.output_tokens) / r.latency_ms) * 1000) : null,
+      })) });
+    }),
+  );
+
+  /** Model discovery for a credential that has not been stored yet — the same
+   * question the wizard asks, answerable after installation too. Without it
+   * the admin page could not offer the full provider form, and the first
+   * choice made during setup became a trap. The key comes from the request,
+   * is used for the one listing call, and is never written or echoed. */
+  r.post(
+    '/models',
+    handle(async (req, res) => {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const provider = str(body.provider, 32);
+      if (!savableProviders().includes(provider)) {
+        throw new RouteError(400, 'choose a model provider');
+      }
+      const { secrets, settings } = readCredentials(provider, body);
+      const revealed = revealForDiscovery(secrets);
+      const result = await discoverModels({
+        provider: provider as never,
+        apiKey: revealed.apiKey ?? null,
+        baseUrl: str(body.baseUrl, 500) || null,
+        secrets: revealed,
+        config: settings,
+        fetchImpl: ctx.fetchImpl,
+        resolve: ctx.resolve,
+      });
+      return res.json({
+        ok: result.ok,
+        unsupported: !!result.unsupported,
+        models: result.models,
+        category: result.category ?? null,
+        message: result.message ?? null,
+        providerCode: result.providerCode ?? null,
+        // Whether this list came from the provider or from Josi's own versioned
+        // catalogue, and when that catalogue was last edited. The operator is
+        // told which kind of list they are looking at rather than being left to
+        // assume the provider answered.
+        fromCatalog: !!result.fromCatalog,
+        catalogVersion: result.catalogVersion ?? null,
+        allowsCustomModel: !!result.allowsCustomModel,
+      });
+    }),
+  );
+
+  // The setup wizard has the same first-party device flow, but its routes are
+  // intentionally gone after installation. Administrators still need to sign
+  // in, reconnect, inspect status and sign out from the Model page.
+  if (hasCapability('subscription_auth')) {
+    r.use('/subscription', codexSubscriptionRouter(ctx));
+
+    r.use('/subscription/claude', claudeSubscriptionRouter(ctx));
+  }
+
+  /** Configure a provider.
+   *
+   * Saving ALWAYS clears the probe result and deactivates. A model that was
+   * proven to call tools yesterday says nothing about the one whose name was
+   * just typed in — and leaving the old capabilities attached would silently
+   * re-enable features against an untested model. */
+  r.put(
+    '/providers/:role',
+    handle(async (req, res) => {
+      const role = param(req, 'role');
+      if (role !== 'primary' && role !== 'fallback') throw new RouteError(404, 'no such provider slot');
+
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const provider = str(body.provider, 32);
+      const model = str(body.model, 120);
+      const baseUrl = str(body.baseUrl, 500);
+      const apiKey = asSecret(body.apiKey);
+      const acknowledged = body.externalAcknowledged === true;
+
+      // The capability boundary, at the save path. A hosted build's list does
+      // not contain `openai_subscription`, so this is the refusal that a
+      // hand-crafted request gets — and it is deliberately the same "choose a
+      // model provider" as an unknown name, because a hosted build should not
+      // confirm that the option exists somewhere.
+      if (!savableProviders().includes(provider)) {
+        throw new RouteError(400, 'choose a model provider');
+      }
+      const subscription = isSubscriptionProvider(provider);
+      // A subscription CLI chooses its plan's model itself; an empty name here
+      // means exactly that. Requiring one forced the UI to invent an
+      // identifier, and the invented one then leaked into the next provider
+      // switch — a Claude row carrying `gpt-5-codex` is how this rule was
+      // found to be wrong.
+      if (!model && !subscription) throw new RouteError(400, 'a model name is required');
+      if (subscription) {
+        // L3.4. Accepting a key here — even to ignore it — would leave a route
+        // that takes a credential under the word "subscription". The database
+        // refuses the shape too; this refuses the request.
+        if (!apiKey.isEmpty) {
+          throw new RouteError(
+            400,
+            'this option uses your own Codex sign-in on this machine, so there is no API key to '
+            + 'give. If you want to use an API key, choose OpenAI instead — it is billed per call.',
+          );
+        }
+      }
+
+      const external = isExternalProvider(provider);
+      if (external && (await isLocalOnly(db))) {
+        // Refusing at save time as well as at call time. Storing a provider
+        // that can never be used is a trap for whoever configures it next.
+        throw new RouteError(
+          409,
+          'Local-only mode is on, so a hosted provider cannot be configured. Turn Local-only off first if that is what you want.',
+        );
+      }
+      if (external && !acknowledged) {
+        throw new RouteError(
+          400,
+          'to use a hosted model provider you must acknowledge that the data needed for each request leaves this server '
+          + "and is processed under that provider's terms",
+        );
+      }
+      // Which credentials this provider needs is the catalogue's answer, and it
+      // is checked against the merged envelope further down. The rule this
+      // replaces asked every external provider for an "API key", which is not
+      // what Bedrock, Vertex, ERNIE or Hunyuan take — they would have been
+      // refused for not supplying a field they do not have.
+      const descriptor = describeProvider(provider);
+      if (!descriptor) throw new RouteError(400, 'choose a model provider');
+
+      if (descriptor.baseUrlMode === 'required' && !baseUrl) {
+        throw new RouteError(
+          400,
+          provider === 'openai_compatible'
+            ? 'a base URL is required for a self-hosted endpoint'
+            : 'this provider needs the address of your own endpoint',
+        );
+      }
+      if (baseUrl) {
+        if (descriptor.baseUrlMode === 'none') {
+          // A base URL on a provider whose endpoint is derived from its own
+          // configuration would be silently ignored, and a setting that does
+          // nothing is worse than one that is refused.
+          throw new RouteError(400, 'this provider does not take an endpoint address');
+        }
+        // Resolves and classifies. Loopback and LAN pass; cloud metadata does
+        // not. See packages/llm/src/ssrf.ts for why that split is the right one.
+        await validateEndpoint(baseUrl, { resolve: ctx.resolve });
+      }
+
+      const { secrets, settings } = readCredentials(provider, body);
+      const command = subscription
+        ? (str(body.subscriptionCommand, 200) || (provider === 'anthropic_subscription' ? DEFAULT_CLAUDE_COMMAND : DEFAULT_CODEX_COMMAND))
+        : null;
+      let key: MasterKey | null = null;
+      try { if (ctx.masterKey !== false) key = loadMasterKey(ctx.masterKey ?? {}); } catch { /* Keyless models remain configurable. */ }
+      await saveModelConfiguration(db, key, {
+        role, provider: descriptor.kind, model, baseUrl: descriptor.baseUrlMode === 'none' ? null : (baseUrl || null),
+        acknowledged: external || acknowledged, subscriptionCommand: command, secrets, settings, actorUserId: req.user!.id,
+      });
+
+      // A model this server already checked (same provider, model and address)
+      // within the last 30 days takes its remembered result and is active at
+      // once, so switching between known models costs nothing. A model never
+      // checked here still gets its one real check.
+      const [remembered] = await db.query<{ probed_at: string; probe_steps: unknown; cap_chat: boolean | null; cap_structured_output: boolean | null; cap_tool_calling: boolean | null; cap_vision: boolean | null; cap_context_tokens: number | null }>(
+        `select probed_at, probe_steps, cap_chat, cap_structured_output, cap_tool_calling, cap_vision, cap_context_tokens from llm_probe_memory
+         where provider = $1 and model = $2 and base_url = $3 and cap_chat = true and probed_at > now() - interval '30 days'`,
+        [descriptor.kind, model, descriptor.baseUrlMode === 'none' ? '' : (baseUrl || '')]);
+      // On a subscription path (Claude Code, Codex) the capabilities belong to
+      // the path, not to the model alias: what the server proved for one model
+      // of the plan carries over to its siblings, so a switch is instant. The
+      // client confirms the new model quietly afterwards (verify: true).
+      const sibling = remembered ? null : (await db.query<typeof remembered>(
+        `select probed_at, probe_steps, cap_chat, cap_structured_output, cap_tool_calling, cap_vision, cap_context_tokens from llm_probe_memory
+         where provider = $1 and provider in ('anthropic_subscription', 'openai_subscription') and cap_chat = true and probed_at > now() - interval '30 days'
+         order by probed_at desc limit 1`, [descriptor.kind]))[0] ?? null;
+      const carried = remembered ?? sibling;
+      if (carried) {
+        await db.query(
+          `update llm_providers set probed_at = $2, probe_steps = $3, cap_chat = $4, cap_structured_output = $5, cap_tool_calling = $6, cap_vision = $7, cap_context_tokens = $8,
+             activated_at = coalesce(activated_at, now()) where role = $1`,
+          [role, carried.probed_at, json(carried.probe_steps), carried.cap_chat, carried.cap_structured_output, carried.cap_tool_calling, carried.cap_vision, carried.cap_context_tokens]);
+        return res.json({ provider: await providerDto(db, role), needsProbe: false, remembered: carried.probed_at, verify: !remembered });
+      }
+      return res.json({ provider: await providerDto(db, role), needsProbe: true });
+    }),
+  );
+
+  r.delete(
+    '/providers/fallback',
+    handle(async (req, res) => {
+      let key: MasterKey | null = null;
+      try { if (ctx.masterKey !== false) key = loadMasterKey(ctx.masterKey ?? {}); } catch { /* Bound removal needs no decryption key. */ }
+      await removeModelConfiguration(db, 'fallback', req.user!.id, key);
+      return res.status(204).end();
+    }),
+  );
+
+  /** Where the probe started by the POST below is right now, so the app can
+   * show which check is running. A view of this process's memory only. */
+  r.get(
+    '/providers/:role/probe/progress',
+    handle(async (req, res) => {
+      const role = param(req, 'role');
+      if (role !== 'primary' && role !== 'fallback') throw new RouteError(404, 'no such provider slot');
+      return res.json(probeProgress(role));
+    }),
+  );
+
+  /** Run the capability probe and store what it observed.
+   *
+   * This is the ONLY thing that sets `activated_at`. Nothing is inferred from
+   * the model name, and a probe that cannot hold a basic conversation leaves
+   * the provider inactive. */
+  r.post(
+    '/providers/:role/probe',
+    handle(async (req, res) => {
+      const role = param(req, 'role');
+      if (role !== 'primary' && role !== 'fallback') throw new RouteError(404, 'no such provider slot');
+
+      const stored = await loadStoredProvider(db, role);
+      if (!stored) throw new RouteError(404, 'that provider is not configured');
+      if (!stored.updated_at) throw new RouteError(409, 'the model configuration could not be verified');
+
+      let result;
+      let preparedVersion: string | undefined;
+      const track = trackProbe(role);
+      try {
+        const provider = await buildProvider(
+          {
+            db,
+            masterKey: ctx.masterKey === false ? null : loadMasterKey(ctx.masterKey ?? {}),
+            fetchImpl: ctx.fetchImpl,
+            resolve: ctx.resolve,
+            codexRunner: ctx.codexRunner,
+          },
+          stored,
+        );
+        preparedVersion = provider.configurationVersion;
+        // Metered. Probing a hosted provider is four real requests on a real
+        // invoice; leaving them out of the usage report would understate spend.
+        result = await probeProvider(meteredProvider(db, stored, role, provider, { purpose: 'probe' }), { onProgress: track.onProgress });
+      } catch (err) {
+        // A refusal (Local-only, missing acknowledgment, unusable key) is not a
+        // failed probe — nothing was asked. Say which it was.
+        const message = err instanceof LlmError || err instanceof VaultError ? err.message : 'the probe could not run';
+        return res.status(err instanceof VaultLockedError ? 423 : 409).json({ error: message });
+      } finally {
+        track.done();
+      }
+
+      const updated = await db.query<{ role: string }>(
+        `update llm_providers set
+           probed_at = $2, probe_steps = $3,
+           cap_chat = $4, cap_structured_output = $5, cap_tool_calling = $6, cap_vision = $7, cap_context_tokens = $8,
+           activated_at = case when $4 then coalesce(activated_at, now()) else null end
+         where role = $1 and updated_at::text = $9::text returning role`,
+        [
+          // json(), not JSON.stringify + ::jsonb. Hand-serialising is what
+          // db.ts warns about: postgres.js types a JS string as text, so the
+          // cast stores a jsonb STRING SCALAR rather than an array, and reading
+          // it back yields a string. It is silent in pglite and permanent in
+          // production — the admin model page crashed on `.map is not a
+          // function` because of exactly this.
+          role, result.probedAt, json(result.steps),
+          result.capabilities.chat, result.capabilities.structuredOutput,
+          result.capabilities.toolCalling, result.capabilities.vision, result.capabilities.contextTokens,
+          preparedVersion ?? stored.updated_at,
+        ],
+      );
+      if (!updated.length) {
+        return res.status(409).json({ error: 'The model changed during the test. Test the current selection again.' });
+      }
+      // Remember the result for this model, so choosing it again is instant.
+      await db.query(
+        `insert into llm_probe_memory (provider, model, base_url, probed_at, probe_steps, cap_chat, cap_structured_output, cap_tool_calling, cap_vision, cap_context_tokens)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         on conflict (provider, model, base_url) do update set probed_at = excluded.probed_at, probe_steps = excluded.probe_steps, cap_chat = excluded.cap_chat,
+           cap_structured_output = excluded.cap_structured_output, cap_tool_calling = excluded.cap_tool_calling, cap_vision = excluded.cap_vision, cap_context_tokens = excluded.cap_context_tokens`,
+        [stored.provider, stored.model, stored.base_url ?? '', result.probedAt, json(result.steps), result.capabilities.chat, result.capabilities.structuredOutput,
+          result.capabilities.toolCalling, result.capabilities.vision, result.capabilities.contextTokens]);
+
+      await appendEvent(db, {
+        actorUserId: req.user!.id,
+        actor: 'super_admin',
+        kind: 'llm.probed',
+        payload: { role, capabilities: result.capabilities, passed: result.capabilities.chat },
+      });
+      // Ask the model's own server what context it runs with, so the page
+      // can show the real number beside the result of the test.
+      if (role === 'primary') await refreshModelContext(db, stored, { fetchImpl: ctx.fetchImpl, resolve: ctx.resolve }).catch(() => null);
+
+      const dto = await providerDto(db, role);
+      return res.json({
+        provider: dto,
+        result: { steps: result.steps, fatal: result.fatal },
+        // The consequence, stated plainly, rather than four booleans the
+        // operator has to interpret.
+        disabledFeatures: role === 'primary' ? disabledFeatures(dto?.capabilities ?? null) : [],
+      });
+    }),
+  );
+
+  // -------------------------------------------------------------- local-only
+  r.put(
+    '/local-only',
+    handle(async (req, res) => {
+      const enabled = (req.body ?? {}).enabled === true;
+
+      if (enabled) {
+        // Turning it on while a hosted provider is configured would leave an
+        // installation that claims to be local and cannot answer anything.
+        const rows = await db.query<{ role: string; provider: string }>(
+          `select role, provider from llm_providers`,
+        );
+        const hosted = rows.filter((row) => isExternalProvider(row.provider));
+        if (hosted.length) {
+          throw new RouteError(
+            409,
+            `remove the hosted provider${hosted.length > 1 ? 's' : ''} first (${hosted.map((h) => h.role).join(', ')}), `
+            + 'otherwise Local-only mode would leave this installation with no usable model.',
+          );
+        }
+      }
+
+      await db.query(`update security_policy set local_only = $1 where id = true`, [enabled]);
+      await appendEvent(db, {
+        actorUserId: req.user!.id, actor: 'super_admin', kind: 'llm.local_only_changed',
+        payload: { enabled },
+      });
+      return res.json({ localOnly: enabled });
+    }),
+  );
+
+  // -------------------------------------------------------------------- caps
+  const capValue = (v: unknown, field: string): number | null => {
+    if (v === null || v === undefined || v === '') return null;
+    const n = Number(v);
+    // 0 is refused rather than silently meaning "unlimited": an operator who
+    // types 0 means "stop everything", and null already means "no cap".
+    if (!Number.isFinite(n) || n <= 0) throw new RouteError(400, `${field} must be a positive number, or empty for no cap`);
+    return n;
+  };
+
+  r.put(
+    '/caps',
+    handle(async (req, res) => {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const cost = capValue(body.monthlyCostUsd, 'the monthly spend cap');
+      const tokens = capValue(body.monthlyTokens, 'the monthly token cap');
+      await db.query(
+        `update llm_caps set monthly_cost_usd = $1, monthly_tokens = $2 where id = true`,
+        [cost, tokens],
+      );
+      await appendEvent(db, {
+        actorUserId: req.user!.id, actor: 'super_admin', kind: 'llm.caps_changed',
+        payload: { monthlyCostUsd: cost, monthlyTokens: tokens },
+      });
+      return res.json({ caps: { monthly_cost_usd: cost, monthly_tokens: tokens } });
+    }),
+  );
+
+  r.put(
+    '/caps/users/:userId',
+    handle(async (req, res) => {
+      const userId = param(req, 'userId');
+      const users = await db.query<{ id: string }>(`select id from users where id = $1`, [userId]);
+      if (!users.length) throw new RouteError(404, 'no such user');
+
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const cost = capValue(body.monthlyCostUsd, "the member's monthly spend cap");
+      const tokens = capValue(body.monthlyTokens, "the member's monthly token cap");
+
+      if (cost === null && tokens === null) {
+        await db.query(`delete from llm_user_caps where user_id = $1`, [userId]);
+      } else {
+        await db.query(
+          `insert into llm_user_caps (user_id, monthly_cost_usd, monthly_tokens) values ($1, $2, $3)
+           on conflict (user_id) do update set
+             monthly_cost_usd = excluded.monthly_cost_usd, monthly_tokens = excluded.monthly_tokens`,
+          [userId, cost, tokens],
+        );
+      }
+      await appendEvent(db, {
+        actorUserId: req.user!.id, actor: 'super_admin', kind: 'llm.user_cap_changed',
+        subjectType: 'user', subjectId: userId,
+        payload: { monthlyCostUsd: cost, monthlyTokens: tokens },
+      });
+      return res.json({ userId, monthlyCostUsd: cost, monthlyTokens: tokens });
+    }),
+  );
+
+  // ------------------------------------------------------------------- usage
+  r.get(
+    '/usage',
+    handle(async (_req, res) => {
+      // Aggregate token counts and cost, split by source, per member. How much
+      // someone spent is administration; what they said is not, and no prompt
+      // or reply is stored anywhere to return.
+      const perUser = await db.query(
+        `select u.id as user_id, u.username,
+                sum(l.input_tokens + l.output_tokens)::bigint as tokens,
+                sum(case when l.cost_source = 'reported' then l.cost_usd else 0 end)::float8 as reported_cost_usd,
+                sum(case when l.cost_source = 'estimated' then l.cost_usd else 0 end)::float8 as estimated_cost_usd,
+                count(*)::int as calls
+         from llm_usage l join users u on u.id = l.user_id
+         where l.created_at >= date_trunc('month', now())
+         group by u.id, u.username
+         order by tokens desc`,
+      );
+      return res.json({
+        summary: await usageSummary(db),
+        perUser,
+        cap: await checkCaps(db),
+      });
+    }),
+  );
+
+  return r;
+}
+
+// ------------------------------------------------------------------ member
+
+/** What a signed-in member is allowed to know about the model.
+ *
+ * Deliberately thin. A member needs the provider's human-readable identity to
+ * make an informed data-sharing choice before a native client sends personal
+ * content. The model name, endpoint, credential and other members' usage stay
+ * private. */
+/** Checks every configured model in the background after the server starts,
+ * so no switch ever waits: both slots (primary and fallback), and on a
+ * subscription plan all of its aliases. Each result goes into llm_probe_memory;
+ * a result younger than 30 days is not redone. One pass at a time, never
+ * while an owner-started probe is running, never in tests. */
+export function startModelWarmup(ctx: LlmRoutesCtx, delayMs = 60_000, everyMs = 6 * 3_600_000): () => void {
+  if (process.env.NODE_ENV === 'test' || process.env.VITEST) return () => undefined;
+  const { db } = ctx;
+  let running = false;
+  async function remembered(provider: string, model: string, baseUrl: string) {
+    const [row] = await db.query<{ probed_at: string }>(
+      `select probed_at from llm_probe_memory where provider = $1 and model = $2 and base_url = $3 and cap_chat = true and probed_at > now() - interval '30 days'`,
+      [provider, model, baseUrl]);
+    return !!row;
+  }
+  async function remember(stored: StoredProvider, model: string, result: Awaited<ReturnType<typeof probeProvider>>) {
+    await db.query(
+      `insert into llm_probe_memory (provider, model, base_url, probed_at, probe_steps, cap_chat, cap_structured_output, cap_tool_calling, cap_vision, cap_context_tokens)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       on conflict (provider, model, base_url) do update set probed_at = excluded.probed_at, probe_steps = excluded.probe_steps, cap_chat = excluded.cap_chat,
+         cap_structured_output = excluded.cap_structured_output, cap_tool_calling = excluded.cap_tool_calling, cap_vision = excluded.cap_vision, cap_context_tokens = excluded.cap_context_tokens`,
+      [stored.provider, model, stored.base_url ?? '', result.probedAt, json(result.steps), result.capabilities.chat, result.capabilities.structuredOutput,
+        result.capabilities.toolCalling, result.capabilities.vision, result.capabilities.contextTokens]);
+  }
+  async function pass() {
+    if (running) return; running = true;
+    try {
+      for (const role of ['primary', 'fallback'] as const) {
+        const stored = await loadStoredProvider(db, role);
+        if (!stored) continue;
+        // What the slot already proved counts as a remembered result.
+        if (stored.probed_at && stored.cap_chat) {
+          const [steps] = await db.query<{ probe_steps: unknown }>(`select probe_steps from llm_providers where role = $1`, [role]);
+          await db.query(
+            `insert into llm_probe_memory (provider, model, base_url, probed_at, probe_steps, cap_chat, cap_structured_output, cap_tool_calling, cap_vision, cap_context_tokens)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) on conflict (provider, model, base_url) do nothing`,
+            [stored.provider, stored.model, stored.base_url ?? '', stored.probed_at, json(Array.isArray(steps?.probe_steps) ? steps.probe_steps : []), stored.cap_chat, stored.cap_structured_output, stored.cap_tool_calling, stored.cap_vision, stored.cap_context_tokens]);
+        }
+        const models = stored.provider === 'anthropic_subscription' ? ['haiku', 'sonnet', 'opus'] : [stored.model];
+        for (const model of models) {
+          if (await remembered(stored.provider, model, stored.base_url ?? '')) continue;
+          if (probeProgress(role).running) return; // the owner is checking something; try again next pass
+          try {
+            const candidate: StoredProvider = { ...stored, model };
+            const provider = await buildProvider({ db, masterKey: ctx.masterKey === false ? null : loadMasterKey(ctx.masterKey ?? {}), fetchImpl: ctx.fetchImpl, resolve: ctx.resolve, codexRunner: ctx.codexRunner }, candidate);
+            const result = await probeProvider(meteredProvider(db, candidate, role, provider, { purpose: 'probe' }));
+            await remember(stored, model, result);
+            console.error(`josi-ce: model warmup checked ${stored.provider} ${model}: chat ${result.capabilities.chat}, tools ${result.capabilities.toolCalling}`);
+          } catch (err) {
+            console.error(`josi-ce: model warmup could not check ${stored.provider} ${model}: ${(err as Error).message}`);
+          }
+        }
+      }
+    } catch (err) {
+      console.error(`josi-ce: model warmup pass failed: ${(err as Error).message}`);
+    } finally { running = false; }
+  }
+  const first = setTimeout(() => { void pass(); }, delayMs); first.unref();
+  const repeat = setInterval(() => { void pass(); }, everyMs); repeat.unref();
+  return () => { clearTimeout(first); clearInterval(repeat); };
+}
+
+export function llmRoutes(ctx: LlmRoutesCtx): Router {
+  const r = Router();
+  const { db } = ctx;
+  r.use(requireAuth);
+
+  r.get(
+    '/status',
+    asyncRoute(async (req, res) => {
+      const primary = await loadStoredProvider(db, 'primary');
+      const capabilities = capabilitiesOf(primary);
+      const provider = primary ? describeProvider(primary.provider) : null;
+      return res.json({
+        // Whether Josi can answer at all, and if not, why not.
+        ready: !!primary?.activated_at && capabilities?.chat === true,
+        localOnly: await isLocalOnly(db),
+        disabledFeatures: disabledFeatures(capabilities),
+        // Scoped to the caller. `req.user!.id` is from the session cookie, not
+        // from a parameter, so a member cannot ask about somebody else.
+        usage: await usageSummary(db, req.user!.id),
+        cap: await checkCaps(db, req.user!.id),
+        aiProcessing: {
+          disclosureVersion: 'ai-data-sharing-2026-09-28',
+          provider: provider ? {
+            id: provider.kind,
+            name: provider.label,
+            external: provider.external,
+          } : null,
+          dataCategories: [
+            'Messages you send',
+            'Attachments you choose to send',
+            'Voice transcripts you choose to send',
+            'Email, calendar, contact, task, and other connected-service context used only when needed for your request',
+          ],
+          purpose: 'To generate the response or carry out the action you request.',
+        },
+      });
+    }),
+  );
+
+  return r;
+}

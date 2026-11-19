@@ -1,0 +1,1476 @@
+// The first-run setup wizard.
+//
+// These routes are UNAUTHENTICATED, because they run before any account exists.
+// That makes them the most dangerous surface in the product, and three things
+// hold the door:
+//
+//   1. They exist only while `setup_state.completed = false`. After that they
+//      are 404 — not hidden, not redirected, gone (see http/setupGate.ts).
+//   2. The step order is a server-side state machine. A client cannot pick a
+//      step, skip one, or replay one it has already done.
+//   3. Completion is a conditional UPDATE, so two concurrent finishers resolve
+//      to exactly one winner and the loser is told setup is already done.
+//
+// Nothing here ever reads a role, a user id, a completion flag or an install
+// identity from the request body.
+import { isIP } from 'node:net';
+import { existsSync } from 'node:fs';
+import { rm } from 'node:fs/promises';
+import { Router, type Response } from 'express';
+import multer from 'multer';
+import { RestoreError, backupFolderFile, currentMasterKeyBytes, keySwapAvailable, listBackupFolder, queueMasterKey, reconcileBackupRows, restoreFromFile } from '@josi-ce/ops';
+import {
+  appendEvent, asSecret, ensureWorkspace, getInstallId, getSetupState, getVerifications, initializeVault, json, loadMasterKey, resolveDataPath,
+  updateWorkspace,
+  recordVerification, openSealed, summarizeReview, VaultError, VaultLockedError,
+  type Db, type LoadOptions, type MasterKey, type ReviewItemInput,
+} from '@josi-ce/core';
+import { saveSmtpProfiles, SmtpConfigurationError } from '@josi-ce/mail';
+import { describeProvider, discoverModels, saveModelConfiguration, ModelConfigurationError } from '@josi-ce/llm';
+import { reconcileWorkspaceMount } from '@josi-ce/storage';
+import {
+  CAPABILITIES, buildAuthUrl, clearSystemMailAccount, clientStatuses, connectionsFor, createStateStore, grantsMailSend, isHeyJosiClient,
+  loadClient, NoClientError, saveClient, scopesFor, setSystemMailAccount, systemMailAccount, SystemMailAccountError,
+} from '@josi-ce/connectors';
+import { canonicalDeployment, SETUP_MAIL_RETURN } from '../http/connectorRoutes.js';
+import { claudeSubscriptionRouter, claudeSubscriptionStatus } from '../http/claudeSubscriptionRoutes.js';
+import { codexSubscriptionRouter, codexSubscriptionStatus } from '../http/codexSubscriptionRoutes.js';
+import { hasCapability, readLocalExecutors } from '@josi-ce/core';
+import { pairLocalExecutor } from '../http/pcLocalPairing.js';
+import {
+  providerCatalog, readCredentials, revealForDiscovery, savableProviders, subscriptionOptions,
+} from '../http/llmRoutes.js';
+
+/** The read-only capabilities each provider is asked for at connect time.
+ *
+ * Derived from the capability table rather than listed, so a read capability
+ * added later is covered and a write capability can never drift into the set an
+ * application is registered for. Write access is a separate consent (M32). */
+const READ_ONLY_CAPABILITIES: Record<'google' | 'microsoft', string[]> = {
+  google: CAPABILITIES.filter((c) => c.provider === 'google' && c.kind === 'read').map((c) => c.key),
+  microsoft: CAPABILITIES.filter((c) => c.provider === 'microsoft' && c.kind === 'read').map((c) => c.key),
+};
+import { UserError, createUser, verifyPassword } from '@josi-ce/auth';
+import { archiveUpload } from '../http/archiveUpload.js';
+import { asyncRoute, param } from '../http/async.js';
+import { blockingFailures, runHostChecks } from './hostChecks.js';
+import { STEP_DESCRIPTORS, SETUP_STEPS, canSubmit, nextStep, type SetupStep } from './steps.js';
+import { assertModelIsOffered, verifyAccountMail, verifyLlm, verifyOAuthClient, verifySmtp, SETUP_PROBE_KEY, type VerifyOutcome } from './verifySteps.js';
+import { probeProgress } from '../http/probeProgress.js';
+
+export interface SetupRoutesCtx {
+  db: Db;
+  masterKey?: LoadOptions | false;
+  /** Model-provider HTTP, injected by the suites so no test reaches a real
+   * provider. Unset in production, where the global fetch is used. */
+  llmFetch?: typeof fetch;
+  /** DNS for the SSRF layer that guards model-provider requests. */
+  llmResolve?: (hostname: string) => Promise<string[]>;
+  /** Google/Microsoft HTTP. Separate from `llmFetch` because a suite routinely
+   * stubs one and not the other, and a single seam makes that impossible. */
+  connectorFetch?: typeof fetch;
+  /** SMTP. The runtime harness supplies a real server on the project network
+   * rather than a stub, which is how Phase 8 found three defects the unit
+   * suite could not. */
+  mailTransport?: Parameters<typeof verifySmtp>[0]['transport'];
+  /** For restoring a backup file onto a brand-new server (item 42). */
+  backupWriter?: import('@josi-ce/ops').BackupWriter;
+  restoreReader?: import('@josi-ce/ops').RestoreReader;
+  attachmentsDir?: string | null;
+  version?: string;
+  /** The browser-facing address, for the Google and Microsoft return addresses
+   * the email step shows. */
+  appUrl?: string;
+}
+
+/** Everything setup is allowed to claim it checked.
+ *
+ * A step and a verification are not the same thing: `domain` is a step with
+ * nothing to contact, `llm` is a step whose whole point is that something
+ * answered. Only the latter appear here. */
+export const VERIFIABLE_ITEMS = ['llm', 'smtp'] as const;
+export type VerifiableItem = (typeof VERIFIABLE_ITEMS)[number];
+
+/** Loads the master key, or refuses the request.
+ *
+ * Fail closed: a step that cannot seal its secret stores NOTHING. There is no
+ * plaintext column to fall back to and no "save it unencrypted for now" path,
+ * because that path is how plaintext credentials end up in a database forever. */
+function requireMasterKey(ctx: SetupRoutesCtx): MasterKey {
+  if (ctx.masterKey === false) {
+    throw new SetupError(503, 'this installation cannot store secrets right now');
+  }
+  try {
+    return loadMasterKey(ctx.masterKey ?? {});
+  } catch {
+    // The loader's message names a filesystem path; the operator sees the
+    // actionable half without it.
+    throw new SetupError(
+      503,
+      'the installation master key is missing or unusable, so nothing can be saved securely. Run scripts/install.sh, mount the key, and reload.',
+    );
+  }
+}
+
+class SetupError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
+}
+
+/** Record an observation only against the exact configuration that was tested. */
+async function persistVerification(db: Db, item: string, outcome: VerifyOutcome): Promise<boolean> {
+  if (!db.transaction) throw new SetupError(503, 'Verification storage is unavailable.');
+  return db.transaction(async tx => {
+    if (item === 'llm' && outcome.probe) {
+      const cap = outcome.probe.capabilities;
+      const changed = await tx.query(`update llm_providers set
+        probed_at=$1,cap_chat=$2,cap_structured_output=$3,cap_tool_calling=$4,cap_vision=$5,cap_context_tokens=$6,
+        activated_at=case when $2 then coalesce(activated_at,now()) else null end,probe_steps=$7
+        where role='primary' and updated_at::text=$8 returning role`,
+      [outcome.probe.probedAt, cap.chat, cap.structuredOutput, cap.toolCalling, cap.vision, cap.contextTokens,
+        json(outcome.probe.steps), outcome.configurationVersion ?? null]);
+      if (!changed.length) return false;
+    }
+    if (item === 'smtp' && outcome.configurationVersion) {
+      const changed = await tx.query(`update smtp_profiles set verified_at=case when $1 then now() else null end
+        where kind='system' and updated_at::text=$2 returning kind`, [outcome.status === 'passed', outcome.configurationVersion]);
+      if (!changed.length) return false;
+    }
+    await recordVerification(tx, { item, status: outcome.status, category: outcome.category ?? null, detail: outcome.detail, target: outcome.target ?? null });
+    return true;
+  });
+}
+
+const str = (v: unknown, max = 500): string => (typeof v === 'string' ? v.trim().slice(0, max) : '');
+const bool = (v: unknown): boolean => v === true;
+
+/** Import the deployment choice made by the temporary browser installer.
+ *
+ * The marker is written only after the operator reviews the installer plan.
+ * Values are parsed again here rather than trusted, and an invalid bootstrap
+ * simply leaves the normal Address step in place. This is idempotent so both
+ * GET and POST routes can enforce the same state-machine boundary. */
+async function applyInstallerDeployment(db: Db): Promise<void> {
+  if (process.env.JOSI_LINUX_SERVER === '1') {
+    // The headless Linux server. Its installer asked how people reach it and
+    // started it with APP_URL and JOSI_ACCESS_MODE; server startup already
+    // recorded that domain and HTTPS mode (reconcilePublicAddress). Add the
+    // certificate email, and leave the Address step open so the owner sees
+    // the address, prefilled from linuxInstallerAddress().
+    const email = str(process.env.JOSI_ACME_EMAIL, 320);
+    if (process.env.JOSI_ACCESS_MODE === 'domain' && email.includes('@')) {
+      await db.query(`update deployment_config set acme_email=$1
+        where id=true and acme_email is null
+          and exists(select 1 from setup_state where id=true and completed=false)`, [email]);
+    }
+    return;
+  }
+  if (process.env.JOSI_NATIVE_RUNTIME === '1' && process.env.APP_URL === 'http://localhost:8080') {
+    // Import the already-installed local address. Never overwrite a previously
+    // chosen address or alter proxy/firewall configuration during onboarding.
+    await db.query(`update deployment_config set domain='localhost',tls_mode='bundled_caddy'
+      where id=true and (domain is null or domain='')
+        and exists(select 1 from setup_state where id=true and completed=false)`);
+    await db.query(`update setup_state set completed_steps=array_append(completed_steps,'domain')
+      where id=true and completed=false and not ('domain'=any(completed_steps))
+        and exists(select 1 from deployment_config where id=true and domain='localhost')`);
+    return;
+  }
+  if (process.env.JOSI_INSTALLER_CONFIGURED !== '1') return;
+  const mode = process.env.JOSI_ACCESS_MODE;
+  if (!['lan', 'domain', 'proxy'].includes(mode ?? '')) return;
+  let address: URL;
+  try {
+    address = new URL(process.env.APP_URL ?? '');
+  } catch {
+    return;
+  }
+  if (!['http:', 'https:'].includes(address.protocol) || !address.hostname
+      || address.username || address.password || (address.pathname !== '/' && address.pathname !== '')
+      || address.search || address.hash) return;
+  if (mode === 'domain' && address.protocol !== 'https:') return;
+  if (mode === 'proxy' && address.protocol !== 'https:') return;
+  if (mode === 'lan' && isIP(address.hostname) === 0) return;
+
+  await db.query(
+    `update deployment_config
+     set domain = $1, tls_mode = $2, acme_email = null
+     where id = true`,
+    [address.hostname.toLowerCase(), mode === 'proxy' ? 'external_proxy' : 'bundled_caddy'],
+  );
+  await db.query(
+    `update setup_state
+     set completed_steps = array_append(completed_steps, 'domain'), current_step = 'domain'
+     where id = true and completed = false and not ('domain' = any(completed_steps))`,
+  );
+}
+
+/** A model server already running on this machine (the Docker image bundles Ollama), so the model step can
+ * offer it instead of an empty box. Loopback only, a short timeout, and any failure means "none". */
+export async function localModelSuggestion(fetchImpl: typeof fetch = fetch): Promise<{ baseUrl: string; model: string } | null> {
+  if (process.env.JOSI_LINUX_SERVER !== '1') return null;
+  try {
+    const res = await fetchImpl('http://127.0.0.1:11434/api/tags', { signal: AbortSignal.timeout(800) });
+    if (!res.ok) return null;
+    const body = (await res.json()) as { models?: Array<{ name?: unknown }> };
+    const names = (body.models ?? []).map((m) => m.name).filter((n): n is string => typeof n === 'string' && n.length > 0 && n.length < 200);
+    const name = names.find((n) => /josi/i.test(n)) ?? names[0];
+    return name ? { baseUrl: 'http://127.0.0.1:11434/v1', model: name.replace(/:latest$/, '') } : null;
+  } catch { return null; }
+}
+
+/** What the Linux installer chose, for prefilling the Address step: the
+ * domain field, the HTTPS select and the certificate email. Null elsewhere. */
+async function linuxInstallerAddress(db: Db): Promise<Record<string, unknown> | null> {
+  if (process.env.JOSI_LINUX_SERVER !== '1') return null;
+  const mode = process.env.JOSI_ACCESS_MODE;
+  let url: URL;
+  try { url = new URL(process.env.APP_URL ?? ''); } catch { return null; }
+  if (!['lan', 'domain', 'proxy'].includes(mode ?? '')) return null;
+  const [deployment] = await db.query<{ acme_email: string | null }>(
+    'select acme_email from deployment_config where id = true');
+  return {
+    mode,
+    origin: url.origin,
+    domain: url.hostname.toLowerCase(),
+    tlsMode: mode === 'proxy' ? 'external_proxy' : 'bundled_caddy',
+    acmeEmail: deployment?.acme_email ?? null,
+  };
+}
+
+/** Saving a model is not completing the model step. The five-part probe is the
+ * acceptance gate, and until it passes the server continues to report `llm` as
+ * the current step even after a refresh or a hostile direct POST to SMTP. */
+async function expectedSetupStep(db: Db, completed: readonly string[]): Promise<SetupStep | null> {
+  const ordinary = nextStep(completed);
+  if (!completed.includes('llm')) return ordinary;
+  const verification = (await getVerifications(db)).get('llm');
+  return verification?.status === 'passed' ? ordinary : 'llm';
+}
+
+export function setupRoutes(ctx: SetupRoutesCtx): Router {
+  const r = Router();
+  const { db } = ctx;
+
+  /** Restore a backup file instead of setting up from nothing.
+   *
+   * Open only while the server has no owner: once an account exists this is a
+   * destructive administrator action and lives under /ops. The whole thing
+   * happens in one call; a fresh server has nothing worth a snapshot. */
+  const incomingDir = resolveDataPath('/data/backups/incoming');
+  const receiveArchive = archiveUpload(incomingDir, 'setup');
+  const noOwner = async () => {
+    const [owner] = await db.query<{ present: boolean }>("select exists(select 1 from users where role='super_admin') as present");
+    return !owner?.present;
+  };
+  /** Restores `path` onto this empty server; the same answer for an upload and a file from the backup folder. */
+  const restoreHere = async (path: string, passphrase: string | undefined, res: Response) => {
+    const masterKeyPresent = !!process.env.MASTER_KEY_FILE && existsSync(process.env.MASTER_KEY_FILE);
+    try {
+      const out = await restoreFromFile(db, {
+        path, passphrase, reader: ctx.restoreReader!, attachmentsDir: ctx.attachmentsDir ?? null, masterKeyPresent,
+        currentMasterKey: currentMasterKeyBytes(), installMasterKey: keySwapAvailable() ? queueMasterKey : undefined,
+        versionsDir: resolveDataPath('/data/versions'), keysDir: resolveDataPath('/data/keys'),
+        serverVersion: ctx.version ?? process.env.JOSI_VERSION ?? '0.1.0', actorUserId: null,
+      });
+      await reconcileBackupRows(db, ctx.backupWriter!).catch(() => undefined);
+      res.json({ ok: true, rowsRestored: out.rowsRestored, credentialsRecovered: out.credentialsRecovered, attachmentsRestored: out.attachmentsRestored,
+        restartNeeded: out.restartNeeded, josiVersion: out.manifest.josiVersion, warning: out.warning ?? null });
+    } catch (error) {
+      if (error instanceof RestoreError) { res.status(error.category === 'version_too_new' ? 409 : 400).json({ error: error.message, category: error.category }); return; }
+      throw error;
+    }
+  };
+  const owned = (res: Response) => { res.status(409).json({ error: 'This server already has an owner. Restore from Administration → Backups instead.' }); };
+  r.post('/restore', asyncRoute(async (req, res) => {
+    if (!(await noOwner())) { owned(res); return; }
+    if (!ctx.restoreReader || !ctx.backupWriter) { res.status(503).json({ error: 'restore is not available on this installation' }); return; }
+    try {
+      await new Promise<void>((resolve, reject) => receiveArchive.single('archive')(req, res, (error) => error ? reject(error) : resolve()));
+    } catch (error) {
+      res.status(400).json({ error: error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE' ? 'That file is larger than 8 GB.' : 'The upload could not be read. Choose the backup file and try again.' });
+      return;
+    }
+    if (!req.file) { res.status(400).json({ error: 'choose a backup file' }); return; }
+    const path = req.file.path;
+    const passphrase = typeof req.body?.passphrase === 'string' ? req.body.passphrase.slice(0, 512) : undefined;
+    try { await restoreHere(path, passphrase, res); } finally { await rm(path, { force: true }).catch(() => undefined); }
+  }));
+
+  /** Backup files already sitting in the folder the container was given: a reinstall finds its own backups. */
+  r.get('/restore/folder', asyncRoute(async (_req, res) => {
+    if (!(await noOwner())) { owned(res); return; }
+    const dir = process.env.JOSI_BACKUP_DIR || null;
+    res.json({ configured: !!dir, files: await listBackupFolder(dir) });
+  }));
+  r.post('/restore/folder', asyncRoute(async (req, res) => {
+    if (!(await noOwner())) { owned(res); return; }
+    if (!ctx.restoreReader || !ctx.backupWriter) { res.status(503).json({ error: 'restore is not available on this installation' }); return; }
+    const path = backupFolderFile(process.env.JOSI_BACKUP_DIR || null, req.body?.file);
+    if (!path || !existsSync(path)) { res.status(404).json({ error: 'that file is not in the backup folder' }); return; }
+    const passphrase = typeof req.body?.passphrase === 'string' ? req.body.passphrase.slice(0, 512) : undefined;
+    await restoreHere(path, passphrase, res);
+  }));
+
+  /** Current position. The only thing a client is told about where it is. */
+  r.get(
+    '/state',
+    asyncRoute(async (_req, res) => {
+      await applyInstallerDeployment(db);
+      const state = await getSetupState(db);
+      const next = await expectedSetupStep(db, state.completed_steps ?? []);
+      const [vault] = await db.query<{ initialized_at: string | null; recovery_confirmed_at: string | null }>(
+        'select initialized_at, recovery_confirmed_at from vault_state where id=true');
+      const [owner] = await db.query<{id:string}>("select id from users where role='super_admin' limit 1");
+      const visibleCompleted = next === 'llm'
+        ? (state.completed_steps ?? []).filter((id) => id !== 'llm')
+        : (state.completed_steps ?? []);
+      return res.json({
+        completed: state.completed,
+        recoveryPending: !!vault?.initialized_at && !vault.recovery_confirmed_at,
+        ownerExists: !!owner,
+        // The PC step pairs the Josi app's executor key to this account; the
+        // app derives that key from the owner's id, so setup names it here.
+        ownerId: owner?.id ?? null,
+        completedSteps: visibleCompleted,
+        nextStep: next,
+        steps: SETUP_STEPS.map((id) => ({
+          ...STEP_DESCRIPTORS[id],
+          done: visibleCompleted.includes(id),
+        })),
+        // The same catalogue the admin page is sent, for the same reason: the
+        // wizard must not be able to draw a provider this build would refuse to
+        // save. Without it the installer offered five hardcoded choices while
+        // the server had long since accepted twenty, so a provider was
+        // reachable after installation but not during it.
+        providerCatalog: providerCatalog(),
+        // Linux: the address chosen in the installer, to prefill the Address step.
+        installerAddress: await linuxInstallerAddress(db),
+        // A model server on this machine, to prefill the model step.
+        localModel: await localModelSuggestion(),
+        // The Linux server's own PC service, so the step can pair it here.
+        localPc: readLocalExecutors().map(({ pcId, user, host }) => ({ pcId, user, host }))[0] ?? null,
+      });
+    }),
+  );
+
+  /** Host checks are read-only and repeatable, so they are also a GET. */
+  r.get(
+    '/host-checks',
+    asyncRoute(async (_req, res) => {
+      const checks = await runHostChecks(db, { masterKey: ctx.masterKey });
+      return res.json({ checks, blocking: blockingFailures(checks).map((c) => c.id) });
+    }),
+  );
+
+  /** Where the model check started by /verify/llm is right now, so the app can
+   * show which of the five questions is being asked. */
+  r.get(
+    '/models/probe-progress',
+    asyncRoute(async (_req, res) => res.json(probeProgress(SETUP_PROBE_KEY))),
+  );
+
+  // ---------------------------------------------- email through an account
+  // The email step offers two ways: an SMTP server, or the owner's own Google
+  // or Microsoft account. The second needs three things setup otherwise leaves
+  // for later: the provider's application keys, the owner's account connected,
+  // and that account chosen for Josi's own email. They are done here, for the
+  // owner setup just created, and only while the email step is open.
+
+  /** The owner, when the email step is the current one or is being redone. */
+  async function mailStepOwner(): Promise<{ id: string }> {
+    const state = await getSetupState(db);
+    if (state.completed) throw new SetupError(404, 'not found');
+    if (!canSubmit('smtp', state.completed_steps ?? []).ok) throw new SetupError(409, 'Email is not the current setup step.');
+    const [owner] = await db.query<{ id: string }>("select id from users where role='super_admin' order by created_at limit 1");
+    if (!owner) throw new SetupError(409, 'Complete owner setup before configuring email.');
+    return owner;
+  }
+  const mailRoute = (work: (req: import('express').Request, res: import('express').Response) => Promise<unknown>) =>
+    asyncRoute(async (req, res) => {
+      try { return await work(req, res); }
+      catch (err) {
+        if (err instanceof SetupError) return res.status(err.status).json({ error: err.message });
+        if (err instanceof VaultLockedError) return res.status(423).json({ error: 'Unlock the Vault first.' });
+        throw err;
+      }
+    });
+
+  /** What the email step can offer, and how far the account way has got. */
+  r.get('/mail-account', mailRoute(async (_req, res) => {
+    const state = await getSetupState(db);
+    if (state.completed) throw new SetupError(404, 'not found');
+    const bases = await mailAccountBases(ctx);
+    const clients = await clientStatuses(db);
+    const [owner] = await db.query<{ id: string }>("select id from users where role='super_admin' order by created_at limit 1");
+    const connections = owner ? await connectionsFor(db, { ownerUserId: owner.id }) : [];
+    const chosen = await systemMailAccount(db);
+    return res.json({
+      available: !!bases,
+      publicAddress: bases?.connect ?? null,
+      reason: bases ? null : MAIL_ACCOUNT_NEEDS_HTTPS,
+      providers: MAIL_ACCOUNT_PROVIDERS.map((provider) => {
+        const client = clients.find((c) => c.provider === provider);
+        const connection = connections.find((c) => c.provider === provider && c.status === 'active');
+        return {
+          provider,
+          configured: !!client?.configured,
+          clientId: client?.configured ? client.clientId : null,
+          // Both are registered with the provider: the first connects the
+          // account, the second is the sign-in button on the login page.
+          redirectUris: bases ? [`${bases.connect}/api/connections/${provider}/callback`, `${bases.signIn}/api/auth/${provider}/callback`] : [],
+          connected: connection ? { email: connection.account_email, canSend: grantsMailSend(connection) } : null,
+        };
+      }),
+      chosen: chosen ? { provider: chosen.provider, email: chosen.accountEmail, active: chosen.active } : null,
+    });
+  }));
+
+  /** Save one provider's application keys and ask the provider whether it knows them. */
+  r.put('/mail-account/client/:provider', mailRoute(async (req, res) => {
+    const owner = await mailStepOwner();
+    const provider = param(req, 'provider');
+    if (!isMailAccountProvider(provider)) throw new SetupError(404, 'no such provider');
+    const bases = await mailAccountBases(ctx);
+    if (!bases) throw new SetupError(409, MAIL_ACCOUNT_NEEDS_HTTPS);
+    const clientId = str(req.body?.clientId, 400);
+    const clientSecret = asSecret(req.body?.clientSecret);
+    if (!clientId) throw new SetupError(400, 'Enter the client ID.');
+    if (clientSecret.isEmpty) throw new SetupError(400, 'Enter the client secret.');
+    const key = requireMasterKey(ctx);
+    await saveClient(db, key, {
+      provider, clientId, clientSecret: clientSecret.reveal(),
+      redirectUri: `${bases.connect}/api/connections/${provider}/callback`, actorUserId: owner.id,
+    });
+    const verification = await verifyOAuthClient({ db, masterKey: key, provider, fetchImpl: ctx.connectorFetch });
+    return res.json({ ok: verification.status === 'passed', verification });
+  }));
+
+  /** Start connecting the owner's account. Answers the address to open; the
+   * provider sends the browser back to /api/connections/:provider/callback,
+   * which finishes a setup handshake without a session (connectorRoutes). */
+  r.post('/mail-account/start', mailRoute(async (req, res) => {
+    const owner = await mailStepOwner();
+    const provider = str(req.body?.provider, 16);
+    if (!isMailAccountProvider(provider)) throw new SetupError(400, 'Choose Google or Microsoft.');
+    const key = requireMasterKey(ctx);
+    let client;
+    try { client = await loadClient(db, key, provider); }
+    catch (err) {
+      if (err instanceof NoClientError) throw new SetupError(409, 'Save the client ID and secret first.');
+      throw err;
+    }
+    if (isHeyJosiClient(client)) throw new SetupError(409, 'Save the client ID and secret first.');
+    // The whole bundle once, as the Connections page asks it, so the owner is
+    // not sent back to the consent screen for calendar or files later.
+    const capabilities = CAPABILITIES.filter((c) => c.provider === provider).map((c) => c.key);
+    const scopes = scopesFor(provider, capabilities);
+    const { state, challenge } = await createStateStore(db, key).start({
+      userId: owner.id, sessionId: null, provider, capabilities, scopes, returnPath: SETUP_MAIL_RETURN,
+    });
+    await appendEvent(db, { actorUserId: owner.id, actor: 'user', kind: 'connection.handshake_started', payload: { provider, capabilities, during: 'setup' } });
+    return res.json({ url: buildAuthUrl(client, { state, scopes, codeChallenge: challenge }) });
+  }));
+
+  /** One endpoint per step. The step name is in the PATH, never in the body,
+   * and the server checks it against the state machine before doing anything. */
+  r.post(
+    '/steps/:step',
+    asyncRoute(async (req, res) => {
+      const step = param(req, 'step');
+      await applyInstallerDeployment(db);
+      const state = await getSetupState(db);
+
+      if (state.completed) {
+        // Belt and braces: setupGate should already have 404'd this.
+        return res.status(404).json({ error: 'not found' });
+      }
+
+      const verdict = canSubmit(step, state.completed_steps ?? []);
+      if (!verdict.ok) {
+        const status = verdict.reason === 'unknown_step' ? 404 : 409;
+        return res.status(status).json({
+          error:
+            verdict.reason === 'unknown_step' ? 'no such step'
+            : verdict.reason === 'already_completed' ? 'that step is already done'
+            : verdict.reason === 'setup_finished' ? 'setup is already finished'
+            : 'that is not the current step',
+          expected: verdict.expected,
+        });
+      }
+      const expected = await expectedSetupStep(db, state.completed_steps ?? []);
+      if (expected === 'llm' && step !== 'llm') {
+        return res.status(409).json({ error: 'test the language model before continuing', expected: 'llm' });
+      }
+
+      let result: StepResult | void;
+      try {
+        if (step === 'owner') {
+          if (!db.transaction) throw new SetupError(503, 'Owner setup is unavailable; no account changes were made.');
+          result = await db.transaction(async (tx) => {
+            await tx.query('select id from setup_state where id=true for update');
+            const locked = await getSetupState(tx);
+            if (locked.completed || !canSubmit('owner', locked.completed_steps ?? []).ok)
+              throw new SetupError(409, 'that step is already done');
+            const applied = await applyStep({...ctx,db:tx}, 'owner', req.body ?? {});
+            await tx.query("update setup_state set completed_steps=array_append(completed_steps,'owner'),current_step='owner' where id=true");
+            return applied;
+          });
+        } else result = await applyStep(ctx, step as SetupStep, (req.body ?? {}) as Record<string, unknown>);
+      } catch (err) {
+        if (err instanceof SetupError || err instanceof ModelConfigurationError || err instanceof SmtpConfigurationError) {
+          return res.status(err.status).json({ error: err.message });
+        }
+        if (err instanceof VaultLockedError) return res.status(423).json({ error: err.message });
+        if (err instanceof VaultError) return res.status(409).json({ error: err.message });
+        throw err;
+      }
+
+      // Recorded only after the step's own work succeeded. `array_append` with
+      // a `not ... = any` guard makes a concurrent duplicate a no-op rather than
+      // a doubled entry.
+      await db.query(
+        `update setup_state
+         set completed_steps = array_append(completed_steps, $1), current_step = $1
+         where id = true and completed = false and not ($1 = any(completed_steps))`,
+        [step],
+      );
+
+      const after = await getSetupState(db);
+      return res.json({
+        ok: true,
+        completedSteps: after.completed_steps ?? [],
+        nextStep: await expectedSetupStep(db, after.completed_steps ?? []),
+        // Present for steps that contacted something. A step can succeed — the
+        // configuration was stored — while what it configured did not work, and
+        // the client has to be able to tell those apart.
+        ...(result && 'verification' in result ? { verification: result.verification } : {}),
+        ...(result?.vaultRecovery ? { vaultRecovery: result.vaultRecovery } : {}),
+      });
+    }),
+  );
+
+  /** The models this credential may actually use.
+   *
+   * Asked of the provider rather than served from a list in this repository.
+   * The list that used to be shipped offered identifiers that no account had
+   * been granted and some that did not exist. */
+  r.post(
+    '/models',
+    asyncRoute(async (req, res) => {
+      const state = await getSetupState(db);
+      if (state.completed) return res.status(404).json({ error: 'not found' });
+
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const provider = str(body.provider, 32);
+      if (!savableProviders().includes(provider)) {
+        return res.status(400).json({ error: 'choose a model provider' });
+      }
+
+      // Which fields this provider takes is the catalogue's answer, exactly as
+      // it is on the admin route. Asking only for `apiKey` here is why Bedrock,
+      // Vertex, ERNIE and Hunyuan could not be configured during installation:
+      // their credential is a key pair, a service account or a region, and the
+      // wizard had no way to send one.
+      const { secrets, settings } = readCredentials(provider, body);
+      const revealed = revealForDiscovery(secrets);
+      const result = await discoverModels({
+        provider: provider as never,
+        // Discovery happens BEFORE the step is submitted, so the credential
+        // comes from the request rather than from storage. It is never written
+        // here and never echoed back — only the model list is returned.
+        apiKey: revealed.apiKey ?? null,
+        baseUrl: str(body.baseUrl, 500) || null,
+        secrets: revealed,
+        config: settings,
+        fetchImpl: ctx.llmFetch,
+        resolve: ctx.llmResolve,
+      });
+
+      return res.json({
+        ok: result.ok,
+        unsupported: !!result.unsupported,
+        models: result.models,
+        category: result.category ?? null,
+        message: result.message ?? null,
+        providerCode: result.providerCode ?? null,
+        // Whether the operator is looking at the provider's own list or at the
+        // one Josi ships. The wizard says which, rather than presenting both as
+        // the same kind of fact.
+        fromCatalog: !!result.fromCatalog,
+        catalogVersion: result.catalogVersion ?? null,
+        allowsCustomModel: !!result.allowsCustomModel,
+      });
+    }),
+  );
+
+  // ------------------------------------------- ChatGPT subscription sign-in
+  //
+  // LB2. Phase 13.3 built the provider and told the operator to run
+  // `codex login` in their own terminal. On a Docker installation that cannot
+  // be done: the binary is inside the container, the operator is outside it,
+  // and a login on the host signs in a CLI the application never runs.
+  //
+  // These routes are MOUNTED ONLY on a build whose edition permits the
+  // capability. Not guarded — absent. A hosted build's route table does not
+  // contain them, which is the outermost of the four layers; the guard, the
+  // provider factory and the registry are the other three.
+  if (hasCapability('subscription_auth')) {
+    /** What is on offer, and the honest reason for each thing that is not. */
+    r.get(
+      '/subscription',
+      asyncRoute(async (_req, res) => {
+        const state = await getSetupState(db);
+        if (state.completed) return res.status(404).json({ error: 'not found' });
+        return res.json({
+          options: subscriptionOptions(),
+          cli: await codexSubscriptionStatus(ctx),
+          // Reported separately rather than folded into one "the CLI" field:
+          // an installation can have either, both or neither signed in, and a
+          // single flag could not say which.
+          claudeCli: await claudeSubscriptionStatus(ctx),
+        });
+      }),
+    );
+
+    r.use('/subscription', codexSubscriptionRouter(ctx, true));
+
+    r.use('/subscription/claude', claudeSubscriptionRouter(ctx, true));
+  }
+
+  /** Test one configured thing, for real, and record what happened.
+   *
+   * Separate from the step that saved it so it can be re-run without
+   * re-submitting credentials — LB4.5's rerun control — and so a failure is a
+   * recorded outcome rather than a step that refused to complete. */
+  r.post(
+    '/verify/:item',
+    asyncRoute(async (req, res) => {
+      const state = await getSetupState(db);
+      if (state.completed) return res.status(404).json({ error: 'not found' });
+
+      const item = param(req, 'item');
+      if (!(VERIFIABLE_ITEMS as readonly string[]).includes(item)) {
+        return res.status(404).json({ error: 'there is nothing by that name to test' });
+      }
+
+      let outcome;
+      try {
+        outcome = await runVerification(ctx, item as VerifiableItem, (req.body ?? {}) as Record<string, unknown>);
+      } catch (err) {
+        if (err instanceof SetupError) return res.status(err.status).json({ error: err.message });
+        throw err;
+      }
+
+      if (!(await persistVerification(db, item, outcome))) return res.status(409).json({ error: 'The settings changed during the test. Test the current selection again.' });
+      return res.json(outcome);
+    }),
+  );
+
+  /** A redacted summary of everything captured. Never a secret, never a
+   * ciphertext — the operator is confirming their choices, not auditing the
+   * encryption. */
+  r.get(
+    '/review',
+    asyncRoute(async (_req, res) => res.json(await buildReview(ctx))),
+  );
+
+  /** The point of no return.
+   *
+   * Everything is checked again INSIDE the conditional update, so a step
+   * finished by a concurrent request between the check and the write cannot
+   * produce a half-configured completion. */
+  r.post(
+    '/complete',
+    asyncRoute(async (_req, res) => {
+      const state = await getSetupState(db);
+      if (state.completed) return res.status(404).json({ error: 'not found' });
+
+      const remaining = await expectedSetupStep(db, state.completed_steps ?? []);
+      if (remaining !== null && remaining !== 'review') {
+        return res.status(409).json({ error: 'setup is not finished', expected: remaining });
+      }
+
+      const checks = await runHostChecks(db, { masterKey: ctx.masterKey });
+      const blocking = blockingFailures(checks);
+      if (blocking.length) {
+        return res.status(409).json({
+          error: 'this machine still has a problem that must be fixed first',
+          blocking: blocking.map((c) => ({ id: c.id, label: c.label, detail: c.detail })),
+        });
+      }
+
+      const owner = await db.query<{ id: string }>(`select id from users where role = 'super_admin' limit 1`);
+      if (!owner.length) {
+        // Should be impossible — the owner step precedes this — but completing
+        // without an administrator would lock the installation permanently.
+        return res.status(409).json({ error: 'setup cannot finish without an administrator account' });
+      }
+      const [vaultState]=await db.query<{recovery_confirmed_at:string|null}>(`select recovery_confirmed_at from vault_state where id=true`);
+      if(!vaultState?.recovery_confirmed_at)return res.status(409).json({error:'confirm that the one-time Vault recovery key was saved offline before finishing setup'});
+
+      // Setup cannot close while its required singleton is absent. Rebuild it
+      // from answers already persisted by the owner and domain steps.
+      const [ownerProfile] = await db.query<{ username: string; display_name: string | null }>(
+        `select username, display_name from users where role = 'super_admin' limit 1`,
+      );
+      const [deployment] = await db.query<{ domain: string | null }>(
+        `select domain from deployment_config where id = true`,
+      );
+      await ensureWorkspace(db, {
+        name: ownerProfile?.display_name || ownerProfile?.username || 'My workspace',
+      });
+      if (deployment?.domain) {
+        await updateWorkspace(db, { settings: { publicAddress: deployment.domain } });
+      }
+
+      // LB4.4 / LB6.5. A required thing that failed, or that was never tested,
+      // stops this here. Checked server-side and checked again at the moment of
+      // completion rather than trusted from the review screen, because the
+      // review screen is a client.
+      const review = await buildReview(ctx);
+      if (!review.canComplete) {
+        return res.status(409).json({
+          error: 'something that has to work does not work yet',
+          blocking: review.blocking.map((b) => ({
+            key: b.key, label: b.label, status: b.status, detail: b.verification?.detail ?? null,
+          })),
+        });
+      }
+
+      const installId = await getInstallId(db);
+      const sealed = await sealSetupOnce(db, installId);
+      if (!sealed) {
+        // Someone else won the race. Setup is over either way.
+        return res.status(404).json({ error: 'not found' });
+      }
+
+      await appendEvent(db, {
+        actor: 'system',
+        kind: 'setup.completed',
+        subjectType: 'workspace',
+        payload: { steps: (state.completed_steps ?? []).length },
+      });
+
+      return res.json({ ok: true, completedAt: sealed.completed_at });
+    }),
+  );
+
+  r.get('/vault-recovery', asyncRoute(async (_req, res) => {
+    res.set('Cache-Control', 'no-store');
+    const [row] = await db.query<{pending_setup_recovery_enc:string|null;recovery_key_fingerprint:string;recovery_confirmed_at:string|null}>(
+      'select pending_setup_recovery_enc,recovery_key_fingerprint,recovery_confirmed_at from vault_state where id=true');
+    if (!row?.pending_setup_recovery_enc || row.recovery_confirmed_at)
+      return res.status(409).json({error:'The original recovery key cannot be shown again. Preserve your saved key and contact your administrator before continuing.'});
+    return res.json({key:openSealed<{key:string}>(requireMasterKey(ctx),row.pending_setup_recovery_enc).key,fingerprint:row.recovery_key_fingerprint});
+  }));
+  r.post('/vault-recovery-confirmed',asyncRoute(async(_req,res)=>{const rows=await db.query(`update vault_state set recovery_confirmed_at=now(),pending_setup_recovery_enc=null,updated_at=now() where id=true and initialized_at is not null returning id`);if(!rows.length)return res.status(409).json({error:'the Master Vault is not initialized'});return res.json({ok:true});}));
+
+  return r;
+}
+
+/** The latch that ends setup, extracted so it can be tested on its own.
+ *
+ * `completed = false` in the WHERE clause is the whole of the single-use
+ * guarantee: whichever caller gets there first updates the row, and every later
+ * caller updates zero rows and gets null back. Returning null is not an error
+ * — it is the correct answer to "did I win the race", and the route turns it
+ * into the same 404 an already-finished installation gives.
+ *
+ * This lives in its own function because the route's early `if (completed)`
+ * check would otherwise mask it: a test driving HTTP can never tell whether the
+ * early check or this clause did the work, and a database that serialises
+ * queries (pglite, in the unit suite) makes the early check win every time. */
+export async function sealSetupOnce(
+  db: Db,
+  installId: string,
+): Promise<{ completed_at: string } | null> {
+  const rows = await db.query<{ completed_at: string }>(
+    `update setup_state
+     set completed = true, current_step = 'done', completed_at = now(),
+         install_id = $1,
+         completed_steps = array(select distinct unnest(completed_steps || array['review']))
+     where id = true and completed = false
+     returning completed_at`,
+    [installId],
+  );
+  return rows[0] ?? null;
+}
+
+// ---------------------------------------------------------------- step logic
+
+/** A step's own result.
+ *
+ * Steps that contact something return what happened, so the client can show it
+ * immediately rather than making a second request to find out whether the thing
+ * it just configured works. */
+interface StepResult {
+  verification?: unknown;
+  vaultRecovery?: { key:string; fingerprint:string };
+}
+
+async function applyStep(
+  ctx: SetupRoutesCtx,
+  step: SetupStep,
+  body: Record<string, unknown>,
+): Promise<StepResult | void> {
+  const { db } = ctx;
+
+  switch (step) {
+    // ------------------------------------------------------------ host checks
+    case 'host_checks': {
+      const checks = await runHostChecks(db, { masterKey: ctx.masterKey });
+      const blocking = blockingFailures(checks);
+      if (blocking.length) {
+        throw new SetupError(409, `this machine is not ready: ${blocking.map((c) => c.detail).join(' ')}`);
+      }
+      // Recorded so an operator can see later what the machine looked like.
+      for (const c of checks) {
+        await db.query(
+          `insert into setup_host_checks (check_id, status, label, mandatory) values ($1, $2, $3, $4)`,
+          [c.id, c.status, c.label, c.mandatory],
+        );
+      }
+      return;
+    }
+
+    // ----------------------------------------------------------------- owner
+    case 'owner': {
+      const email = str(body.email, 320);
+      const username = str(body.username, 64);
+      const displayName = str(body.displayName, 120);
+      const timezone = str(body.timezone, 80) || 'UTC';
+      const password = asSecret(body.password);
+
+      if (body.resumeOwner === true) {
+        const [owner] = await db.query<{id:string;email:string;username:string;password_hash:string|null}>(
+          "select id,email,username,password_hash from users where role='super_admin' limit 1");
+        const identifier=str(body.identifier,320).toLowerCase();
+        if (!owner || ![owner.email.toLowerCase(),owner.username.toLowerCase()].includes(identifier)
+            || !await verifyPassword(owner.password_hash,password.reveal()))
+          throw new SetupError(400, 'The owner sign-in details did not match.');
+        const [vault] = await db.query<{initialized_at:string|null;initialized_by:string|null;pending_setup_recovery_enc:string|null;recovery_key_fingerprint:string}>(
+          'select initialized_at,initialized_by,pending_setup_recovery_enc,recovery_key_fingerprint from vault_state where id=true');
+        if (vault?.initialized_at) {
+          if (vault.initialized_by !== owner.id) throw new SetupError(409, 'Preserve this installation and ask its administrator to review the existing vault.');
+          return vault.pending_setup_recovery_enc ? {vaultRecovery:{
+            key:openSealed<{key:string}>(requireMasterKey(ctx),vault.pending_setup_recovery_enc).key,
+            fingerprint:vault.recovery_key_fingerprint}} : undefined;
+        }
+        const initialized=await initializeVault(db,requireMasterKey(ctx),owner.id);
+        return {vaultRecovery:{key:initialized.recoveryKey.reveal(),fingerprint:initialized.fingerprint}};
+      }
+
+      if (!email || !email.includes('@')) throw new SetupError(400, 'a valid email address is required');
+      if (!username) throw new SetupError(400, 'a username is required');
+      if (password.length < 12) throw new SetupError(400, 'the password must be at least 12 characters');
+
+      // The role is a literal here. Nothing from `body` can influence it, so a
+      // request carrying {"role":"member"} or {"role":"super_admin"} changes
+      // nothing at all.
+      try {
+        await ensureWorkspace(db, { name: displayName || username, timezone });
+        const owner=await createUser(db, {
+          email,
+          username,
+          displayName: displayName || null,
+          role: 'super_admin',
+          password: password.reveal(),
+        });
+        await reconcileWorkspaceMount(db);
+        const vault=await initializeVault(db,requireMasterKey(ctx),owner.id);
+        return {vaultRecovery:{key:vault.recoveryKey.reveal(),fingerprint:vault.fingerprint}};
+      } catch (err) {
+        if (err instanceof UserError) {
+          // Includes the one-super-admin constraint, which is what a concurrent
+          // duplicate submission trips.
+          throw new SetupError(409, err.message);
+        }
+        throw err;
+      }
+      // Deliberately no session is issued and no cookie set. The operator signs
+      // in normally once setup finishes; a wizard that hands out an
+      // authenticated session mid-flow is a wizard that can be raced.
+      return;
+    }
+
+    // ---------------------------------------------------------------- domain
+    case 'domain': {
+      const domain = str(body.domain, 253).toLowerCase();
+      const tlsMode = body.tlsMode === 'external_proxy' ? 'external_proxy' : 'bundled_caddy';
+      const acmeEmail = str(body.acmeEmail, 320);
+
+      if (!domain) throw new SetupError(400, 'an address is required');
+      // Hostname, localhost, or a literal LAN address. Not a URL, path, or
+      // scheme. Public ACME certificates need a hostname, but LAN-only Josi is
+      // a supported install and must not lie that its address is invalid.
+      if (isIP(domain) === 0 && !/^(localhost|(?=.{1,253}$)([a-z0-9](-*[a-z0-9])*\.)+[a-z]{2,})$/.test(domain)) {
+        throw new SetupError(400, 'that does not look like a hostname or IP address');
+      }
+      if (acmeEmail && !acmeEmail.includes('@')) throw new SetupError(400, 'that does not look like an email address');
+
+      await db.query(
+        `update deployment_config set domain = $1, tls_mode = $2, acme_email = $3 where id = true`,
+        [domain, tlsMode, acmeEmail || null],
+      );
+      await ensureWorkspace(db);
+      await updateWorkspace(db, { settings: { publicAddress: domain } });
+      // certificate_verified_at is untouched: no ACME challenge has happened,
+      // and claiming otherwise would be a lie the UI then repeats.
+      return;
+    }
+
+    // ------------------------------------------------------------------- LLM
+    case 'llm': {
+      const provider = str(body.provider, 32);
+      const model = str(body.model, 120);
+      const baseUrl = str(body.baseUrl, 500);
+      const apiKey = asSecret(body.apiKey);
+      const acknowledged = bool(body.externalAcknowledged);
+
+      // `openai_subscription` is in this list only on a build whose edition
+      // permits it. On a hosted build it is absent, so the step refuses it with
+      // "choose a model provider" — the same answer as any other unknown
+      // string, which is deliberate: a hosted build should not confirm that
+      // the capability exists to be asked for.
+      if (!savableProviders().includes(provider)) throw new SetupError(400, 'choose a model provider');
+      // Automatic is represented by an empty model on either subscription.
+      // A selected ChatGPT identifier is also accepted and passed to Codex as
+      // --model; the real probe must succeed before it becomes active. A
+      // non-subscription provider still needs an explicit model name.
+      const subscriptionProvider = provider === 'openai_subscription' || provider === 'anthropic_subscription';
+      if (!model && !subscriptionProvider) throw new SetupError(400, 'a model name is required');
+
+      // Subscription authentication is separate from an API key. Codex's
+      // canonical login now lives in the Vault, so the API-key requirement
+      // below must not apply to it. It IS still
+      // external: the bytes reach the vendor, by way of the vendor's own binary.
+      const isSubscription = subscriptionProvider;
+      if (isSubscription) {
+        if (!apiKey.isEmpty) {
+          throw new SetupError(
+            400,
+            'a subscription provider must not be given an API key — that would bill an API account '
+            + 'while calling itself a subscription',
+          );
+        }
+        // Require the selected provider's canonical Vault login. Saving is
+        // not a successful provider probe; verification remains separate.
+        const signedIn = provider === 'anthropic_subscription'
+          ? await claudeSubscriptionStatus(ctx)
+          : await codexSubscriptionStatus(ctx);
+        if (!signedIn.signedIn) {
+          throw new SetupError(400, `${signedIn.detail} Sign in first, then continue.`);
+        }
+      }
+
+      const isExternal = provider !== 'openai_compatible';
+      if (isExternal && !acknowledged) {
+        // M89. Not a checkbox the UI can quietly pre-tick: the server refuses
+        // without it, and the acknowledgment is stored rather than merely shown.
+        throw new SetupError(
+          400,
+          'to use a hosted model provider you must acknowledge that the data needed for each request leaves this server and is processed under that provider\'s terms',
+        );
+      }
+      // Which credentials this provider needs is the catalogue's answer, the
+      // same as on the admin route. The rule this replaces asked every external
+      // provider for an "API key", which is not what Bedrock, Vertex, ERNIE or
+      // Hunyuan take — they would have been refused during installation for
+      // failing to supply a field they do not have.
+      const descriptor = describeProvider(provider);
+      if (!descriptor) throw new SetupError(400, 'choose a model provider');
+
+      const { secrets, settings, secretFields, configFields } = readCredentials(provider, body);
+      const supplied = Object.entries(secrets).filter(([, value]) => !value.isEmpty);
+
+      if (!isSubscription) {
+        const missing = [
+          ...secretFields.filter((f) => f.required && !supplied.some(([key]) => key === f.key)),
+          ...configFields.filter((f) => f.required && !settings[f.key]),
+        ];
+        if (missing.length) {
+          throw new SetupError(
+            400,
+            `this provider needs ${missing.map((f) => f.label.toLowerCase()).join(' and ')}`,
+          );
+        }
+      }
+
+      if (descriptor.baseUrlMode === 'required' && !baseUrl) {
+        throw new SetupError(
+          400,
+          provider === 'openai_compatible'
+            ? 'a base URL is required for a self-hosted endpoint'
+            : 'this provider needs the address of your own endpoint',
+        );
+      }
+      if (baseUrl) {
+        if (descriptor.baseUrlMode === 'none') {
+          // A setting that would be silently ignored is worse than one refused:
+          // this provider's endpoint is derived from its own configuration.
+          throw new SetupError(400, 'this provider does not take an endpoint address');
+        }
+        let parsed: URL;
+        try {
+          parsed = new URL(baseUrl);
+        } catch {
+          throw new SetupError(400, 'that base URL is not a valid URL');
+        }
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+          throw new SetupError(400, 'the base URL must be http or https');
+        }
+      }
+
+      // Before anything is stored: is this model even on offer to this account?
+      //
+      // It used to be free text, and the web app offered a hardcoded list of
+      // identifiers nobody had checked — so an operator could store
+      // `gpt-5.6-luna`, be told they were configured, and discover at the first
+      // real request that no such model had ever existed. Discovery answers
+      // that question with the credential they just supplied.
+      // An empty model on a subscription provider means 'the plan's default':
+      // there is nothing to look up, and asking discovery whether it offers ""
+      // guarantees a refusal with a blank name in it.
+      if (model || !subscriptionProvider) {
+        const revealed = revealForDiscovery(secrets);
+        const offered = await assertModelIsOffered({
+          provider,
+          model,
+          apiKey: revealed.apiKey ?? null,
+          baseUrl: descriptor.baseUrlMode === 'none' ? null : (baseUrl || null),
+          secrets: revealed,
+          config: settings,
+          fetchImpl: ctx.llmFetch,
+          resolve: ctx.llmResolve,
+        });
+        if (!offered.ok) throw new SetupError(400, offered.detail);
+      }
+
+      const modelKey = supplied.length ? requireMasterKey(ctx) : null;
+      const [vaultOwner] = await db.query<{ id: string }>("select id from users where role='super_admin' order by created_at limit 1");
+      if (!vaultOwner) throw new SetupError(409, 'Complete owner setup before configuring a model.');
+      await saveModelConfiguration(db, modelKey, {
+        role: 'primary', provider: descriptor.kind, model, baseUrl: descriptor.baseUrlMode === 'none' ? null : (baseUrl || null),
+        acknowledged: isExternal || acknowledged, secrets: Object.fromEntries(supplied), settings,
+        actorUserId: vaultOwner.id, preserveMissingSecrets: false,
+      });
+      return;
+    }
+
+    // ------------------------------------------------------------------ SMTP
+    case 'smtp': {
+      // A local or single-user installation can become useful before it has a
+      // mail relay. Skipping stores no placeholder profiles; the admin can add
+      // them later, and features that require mail remain honestly unavailable.
+      //
+      // The skip is RECORDED. An unrecorded skip is indistinguishable from a
+      // step nobody reached, and the review screen has to tell those apart:
+      // one is a decision, the other is unfinished work.
+      if (bool(body.skip)) {
+        await recordVerification(db, {
+          item: 'smtp',
+          status: 'skipped',
+          detail: 'Skipped during setup. Josi cannot send invitations, password resets or mail until this is configured.',
+        });
+        return;
+      }
+
+      // The other way: Josi's own email through the Google or Microsoft
+      // account the owner connected a moment ago in this step.
+      if (body.account && typeof body.account === 'object') {
+        const account = body.account as Record<string, unknown>;
+        const provider = str(account.provider, 16);
+        if (!isMailAccountProvider(provider)) throw new SetupError(400, 'Choose Google or Microsoft.');
+        const name = provider === 'google' ? 'Google' : 'Microsoft';
+        const accountTestTo = str(body.testTo, 320);
+        if (!accountTestTo) {
+          throw new SetupError(400, 'Enter an address to send a test message to. Josi does not report mail as working without sending one.');
+        }
+        const accountKey = requireMasterKey(ctx);
+        const [accountOwner] = await db.query<{ id: string }>("select id from users where role='super_admin' order by created_at limit 1");
+        if (!accountOwner) throw new SetupError(409, 'Complete owner setup before configuring email.');
+        const connection = (await connectionsFor(db, { ownerUserId: accountOwner.id, provider })).find((c) => c.status === 'active');
+        if (!connection) throw new SetupError(409, `Connect your ${name} account first.`);
+        try {
+          await setSystemMailAccount(db, { connectionId: connection.id, fromName: str(account.fromName, 120) || 'Josi', actorUserId: accountOwner.id });
+        } catch (err) {
+          if (err instanceof SystemMailAccountError) throw new SetupError(409, err.message);
+          throw err;
+        }
+        const outcome = await verifyAccountMail({ db, masterKey: accountKey, to: accountTestTo, fetchImpl: ctx.connectorFetch });
+        await recordVerification(db, { item: 'smtp', status: outcome.status, category: outcome.category ?? null, detail: outcome.detail, target: outcome.target ?? null });
+        return { verification: outcome };
+      }
+
+      const system = (body.system ?? {}) as Record<string, unknown>;
+      const comms = (body.communications ?? {}) as Record<string, unknown>;
+
+      const sysHost = str(system.host, 253);
+      const sysPort = Number(system.port);
+      const sysSecurity = str(system.security, 16) || 'starttls';
+      const sysUser = str(system.username, 320);
+      const submittedPassword = asSecret(system.password);
+      // Google displays app passwords in four groups separated by spaces.
+      // SMTP AUTH expects the 16 letters without presentation whitespace.
+      const sysPassword = sysHost.trim().toLowerCase() === 'smtp.gmail.com' && !submittedPassword.isEmpty
+        ? asSecret(submittedPassword.reveal().replace(/\s/g, ''))
+        : submittedPassword;
+      const sysFromName = str(system.fromName, 120);
+      const sysFromAddress = str(system.fromAddress, 320);
+
+      // LB4.2. Configuring mail means proving mail can be sent, to an address
+      // the administrator names so the result is checkable by going and
+      // looking. The only alternative is `skip`, handled above.
+      //
+      // Validated here, with the other field checks and BEFORE anything is
+      // written: a refusal has to leave the database exactly as it found it.
+      const testTo = str(body.testTo, 320);
+      if (!testTo) {
+        throw new SetupError(
+          400,
+          'Enter an address to send a test message to, or choose to skip email for now. '
+          + 'Josi does not report mail as working without sending one.',
+        );
+      }
+
+      if (!sysHost) throw new SetupError(400, 'a mail server is required for system mail');
+      if (!Number.isInteger(sysPort) || sysPort < 1 || sysPort > 65535) {
+        throw new SetupError(400, 'that is not a valid port');
+      }
+      if (!['none', 'starttls', 'tls'].includes(sysSecurity)) throw new SetupError(400, 'unknown connection security');
+      if (!sysFromAddress.includes('@')) throw new SetupError(400, 'a valid From address is required for system mail');
+      if (sysHost.trim().toLowerCase() === 'smtp.gmail.com' && !sysPassword.isEmpty && sysPassword.length !== 16) {
+        throw new SetupError(400, 'Google App Passwords must contain exactly 16 letters. Paste all four groups; spaces are removed automatically.');
+      }
+
+      const key = requireMasterKey(ctx);
+      const [vaultOwner] = await db.query<{ id: string }>("select id from users where role='super_admin' order by created_at limit 1");
+      if (!vaultOwner) throw new SetupError(409, 'Complete owner setup before configuring email.');
+      await saveSmtpProfiles(db, key, {
+        actorUserId: vaultOwner.id,
+        system: { host: sysHost, port: sysPort, security: sysSecurity, username: sysUser || null, password: sysPassword,
+          fromName: sysFromName || null, fromAddress: sysFromAddress, clearPassword: bool(system.clearPassword) },
+        communications: { copyFromSystem: bool(comms.copyFromSystem), host: str(comms.host, 253), port: Number(comms.port),
+          security: str(comms.security, 16) || 'starttls', username: str(comms.username, 320) || null, password: asSecret(comms.password),
+          fromName: str(comms.fromName, 120) || null, fromAddress: str(comms.fromAddress, 320), clearPassword: bool(comms.clearPassword) },
+      });
+      // An SMTP server was chosen, so a connected account stops sending
+      // Josi's own email. The account itself stays connected.
+      await clearSystemMailAccount(db, vaultOwner.id);
+      // The message goes out now, with the credentials that were just stored.
+      const outcome = await verifySmtp({
+        db, masterKey: requireMasterKey(ctx), to: testTo, transport: ctx.mailTransport,
+      });
+      if (!(await persistVerification(db, 'smtp', outcome))) throw new SetupError(409, 'The mail settings changed during the test. Test the current settings again.');
+      return { verification: outcome };
+    }
+
+    // ------------------------------------------------------------ connectors
+    // -------------------------------------------------------------- security
+    case 'security': {
+      // Deny-by-default is the column default. A field that is absent or
+      // malformed leaves the restrictive value in place; only an explicit
+      // `true` opens anything.
+      const retention = Number(body.auditRetentionDays);
+      const allowedRetention = [30, 90, 365, 0];
+      await db.query(
+        `update security_policy set
+           folder_mapping_enabled = $1,
+           folder_sharing_enabled = $2,
+           workspace_wide_sharing_enabled = $3,
+           ocr_enabled = $4,
+           clamav_enabled = $5,
+           audit_retention_days = $6
+         where id = true`,
+        [
+          bool(body.folderMappingEnabled),
+          body.folderSharingEnabled === false ? false : true,
+          bool(body.workspaceWideSharingEnabled),
+          bool(body.ocrEnabled),
+          bool(body.clamavEnabled),
+          allowedRetention.includes(retention) ? retention : 365,
+        ],
+      );
+      // local_file_access_enabled is deliberately not settable here. Local
+      // access needs a Docker mount as well as an application allowlist, so it
+      // cannot be switched on from a web form (M45).
+      return;
+    }
+
+    // ------------------------------------------------------------ pc control
+    case 'pc_control': {
+      // Skipping writes nothing; PC Control stays off and unpaired, and the
+      // owner can pair later from the app or from chat.
+      if (body.skip === true) return;
+      // A Linux server pairs its own PC service (josi-pc.service) right here:
+      // the account password is the approval, as on the PC Control page.
+      if (typeof body.localPcId === 'string') {
+        const local = readLocalExecutors().find(h => h.pcId === body.localPcId);
+        if (!local) throw new SetupError(400, 'The PC service on this server is not running. Skip this step; run the installer again later and choose PC control.');
+        const [owner] = await db.query<{ id: string; password_hash: string | null }>("select id, password_hash from users where role='super_admin' limit 1");
+        if (!owner) throw new SetupError(409, 'Create your account first.');
+        if (!await verifyPassword(owner.password_hash, typeof body.password === 'string' ? body.password : ''))
+          throw new SetupError(401, 'That password did not match your account.');
+        await pairLocalExecutor(db, owner.id, local.pcId);
+        if (body.enable === true) {
+          await db.query('update pc_control_settings set enabled=true, full_control=true where owner_user_id=$1 and pc_id=$2', [owner.id, local.pcId]);
+          await db.query('insert into pc_control_activity(owner_user_id,pc_id,kind) values($1,$2,$3)', [owner.id, local.pcId, 'Control and everyday allowances enabled during setup; commands and high-risk actions still ask']);
+        }
+        return;
+      }
+      const pcId = typeof body.pcId === 'string' && /^[a-z0-9-]{1,80}$/.test(body.pcId) ? body.pcId : null;
+      const key = typeof body.publicKey === 'string' && body.publicKey.length <= 100 ? body.publicKey : null;
+      if (!pcId || !key) throw new SetupError(400, 'Approve this PC from the Josi app on that computer, or skip this step for now.');
+      const bytes = Buffer.from(key, 'base64');
+      if (bytes.length !== 65 || bytes[0] !== 4) throw new SetupError(400, 'Invalid PC key.');
+      const [owner] = await db.query<{ id: string; password_hash: string | null }>("select id, password_hash from users where role='super_admin' limit 1");
+      if (!owner) throw new SetupError(409, 'Create your account first.');
+      // The password of the account just created is the authorization: setup
+      // routes are unauthenticated, and this binds a key that will later sign
+      // every executor request for this PC.
+      if (!await verifyPassword(owner.password_hash, typeof body.password === 'string' ? body.password : ''))
+        throw new SetupError(401, 'That password did not match your account.');
+      await db.query('insert into pc_control_settings(owner_user_id,pc_id) values($1,$2) on conflict do nothing', [owner.id, pcId]);
+      const [existing] = await db.query<{ public_key: string }>('select public_key from pc_executor_identity where owner_user_id=$1 and pc_id=$2', [owner.id, pcId]);
+      if (existing && existing.public_key !== key) throw new SetupError(409, 'This PC already has a different approved key. Revoke it under PC Control first.');
+      if (!existing) await db.query('insert into pc_executor_identity(owner_user_id,pc_id,public_key) values($1,$2,$3)', [owner.id, pcId, key]);
+      if (body.enable === true) {
+        // Everyday allowances come with it (apps, files, windows); commands and
+        // the high-risk actions still ask, as the step's wording says.
+        await db.query('update pc_control_settings set enabled=true, full_control=true where owner_user_id=$1 and pc_id=$2', [owner.id, pcId]);
+        await db.query('insert into pc_control_activity(owner_user_id,pc_id,kind) values($1,$2,$3)', [owner.id, pcId, 'Control and everyday allowances enabled during setup; commands and high-risk actions still ask']);
+      }
+      return;
+    }
+
+    // ------------------------------------------------------------- telemetry
+    case 'telemetry': {
+      // Only a literal `true` enables it. `"true"`, `1`, `"yes"`, `{}` and a
+      // missing field all leave it off.
+      const enabled = body.enabled === true;
+      await db.query(
+        `update telemetry_state set enabled = $1, opted_in_at = $2 where id = true`,
+        [enabled, enabled ? new Date().toISOString() : null],
+      );
+      // Nothing is transmitted in this phase, whatever the answer.
+      return;
+    }
+
+    // ---------------------------------------------------------------- review
+    case 'review':
+      // Reviewing is reading. The write is POST /complete.
+      return;
+  }
+}
+
+// ------------------------------------------------------------------- review
+
+/** The public HTTPS origin this installation is reachable at, or null.
+ *
+ * Null is the honest answer for a LAN-only installation, and callers are
+ * expected to say so rather than to synthesise `https://192.168.1.50` — which
+ * no provider will accept as a redirect URI and which would send an operator
+ * round a loop of provider error pages looking for their own mistake. */
+export async function publicHttpsBase(db: Db): Promise<string | null> {
+  const [deployment] = await db.query<{ domain: string | null }>(
+    `select domain from deployment_config where id = true`,
+  );
+  const domain = deployment?.domain?.trim().toLowerCase();
+  if (!domain) return null;
+  // A bare IP address cannot hold a publicly trusted certificate, and
+  // `localhost` is not reachable from a provider's servers.
+  if (domain === 'localhost' || isIP(domain) !== 0) return null;
+  return `https://${domain}`;
+}
+
+// ---------------------------------------------------------- running the tests
+
+async function runVerification(
+  ctx: SetupRoutesCtx,
+  item: VerifiableItem,
+  body: Record<string, unknown>,
+): Promise<VerifyOutcome> {
+  const { db } = ctx;
+
+  if (item === 'llm') {
+    let masterKey: MasterKey | null = null;
+    try {
+      masterKey = requireMasterKey(ctx);
+    } catch {
+      // A self-hosted endpoint with no key needs none; a hosted one has a
+      // sealed key that cannot be opened without it, and buildProvider says so.
+      masterKey = null;
+    }
+    return verifyLlm({ db, masterKey, fetchImpl: ctx.llmFetch });
+  }
+
+  if (await systemMailAccount(db)) {
+    return verifyAccountMail({ db, masterKey: requireMasterKey(ctx), to: str(body.to, 320), fetchImpl: ctx.connectorFetch });
+  }
+  return verifySmtp({
+    db,
+    masterKey: requireMasterKey(ctx),
+    to: str(body.to, 320),
+    transport: ctx.mailTransport,
+  });
+}
+
+// ------------------------------------------------- email through an account
+
+const MAIL_ACCOUNT_PROVIDERS = ['google', 'microsoft'] as const;
+type MailAccountProviderName = typeof MAIL_ACCOUNT_PROVIDERS[number];
+const isMailAccountProvider = (value: string): value is MailAccountProviderName => (MAIL_ACCOUNT_PROVIDERS as readonly string[]).includes(value);
+const MAIL_ACCOUNT_NEEDS_HTTPS = 'Google and Microsoft only return to a public HTTPS address, and this Josi was set up with a local one. Use an SMTP server now; you can add Google or Microsoft later under Connectors once Josi has a domain.';
+
+/** The two addresses a provider must be told about, or null when this Josi
+ * has no public HTTPS address to return to. Connecting returns to the address
+ * stored with the application; sign-in returns to APP_URL, as authRoutes builds it. */
+async function mailAccountBases(ctx: SetupRoutesCtx): Promise<{ connect: string; signIn: string } | null> {
+  const appUrl = (ctx.appUrl ?? '').replace(/\/$/, '');
+  const { publicHttpsBase: base } = await canonicalDeployment(ctx.db, appUrl);
+  if (!base) return null;
+  return { connect: base, signIn: appUrl.startsWith('https://') ? appUrl : base };
+}
+
+// ------------------------------------------------------------------- review
+
+/** What the review screen is allowed to say about each thing.
+ *
+ * The old version derived every status from "does a row exist", so a credential
+ * that had never been used and one that worked read identically — and the
+ * connector line said "accounts are connected once connector support ships"
+ * long after connector support had shipped.
+ *
+ * Status now comes from `summarizeReview`, which can only say "tested" when a
+ * verification passed. */
+async function reviewItems(ctx: SetupRoutesCtx): Promise<ReviewItemInput[]> {
+  const { db } = ctx;
+  const verifications = await getVerifications(db);
+
+  const [llm] = await db.query<{ provider: string; model: string }>(
+    `select provider, model from llm_providers where role = 'primary'`,
+  );
+  const [systemMail] = await db.query<{ host: string | null }>(
+    `select host from smtp_profiles where kind = 'system'`,
+  );
+  // Google and Microsoft are deliberately absent. Registering an OAuth
+  // application needs a public HTTPS callback, which a LAN-only installation
+  // does not have at setup time, so the wizard used to carry two items that
+  // could only ever report themselves unavailable. They are administered after
+  // installation, once a domain exists — see the admin Connectors page.
+  return [
+    {
+      key: 'llm',
+      label: 'Language model',
+      required: true,
+      configured: !!llm,
+      verification: verifications.get('llm') ?? null,
+    },
+    {
+      key: 'smtp',
+      label: 'Email sending',
+      required: false,
+      configured: !!systemMail || !!(await systemMailAccount(db)),
+      verification: verifications.get('smtp') ?? null,
+    },
+  ];
+}
+
+async function buildReview(ctx: SetupRoutesCtx) {
+  const summary = summarizeReview(await reviewItems(ctx));
+  return { ...summary, summary: await buildReviewDetail(ctx.db) };
+}
+
+/** Everything captured, with nothing sensitive in it.
+ *
+ * The rule applied throughout: say THAT a secret is set, never any part of it.
+ * No ciphertext either — an operator confirming their choices has no use for it
+ * and it is one copy-paste away from a support ticket. */
+async function buildReviewDetail(db: Db): Promise<Record<string, unknown>> {
+  const [deployment] = await db.query<{ domain: string | null; tls_mode: string; acme_email: string | null; certificate_verified_at: string | null }>(
+    `select domain, tls_mode, acme_email, certificate_verified_at from deployment_config where id = true`,
+  );
+  const [llm] = await db.query<{ provider: string; model: string; base_url: string | null; api_key_enc: string | null; external_acknowledged: boolean; activated_at: string | null; probe_steps: unknown }>(
+    `select provider, model, base_url, api_key_enc, external_acknowledged, activated_at, probe_steps from llm_providers where role = 'primary'`,
+  );
+  const smtp = await db.query<{ kind: string; copy_from_system: boolean; host: string | null; port: number | null; security: string | null; username: string | null; password_enc: string | null; from_name: string | null; from_address: string | null; verified_at: string | null }>(
+    `select kind, copy_from_system, host, port, security, username, password_enc, from_name, from_address, verified_at from smtp_profiles order by kind`,
+  );
+  // `oauth_clients`, not `connector_configs` — see migration 0018. Selected
+  // column by column rather than with `*`, so widening the query cannot start
+  // serving the sealed secret; that is the same mistake Phase 4's M18 and
+  // Phase 7's M19 both made.
+  const connectors = await db.query<{ provider: string; client_id: string; redirect_uri: string }>(
+    `select provider, client_id, redirect_uri from oauth_clients order by provider`,
+  );
+  const [policy] = await db.query<Record<string, unknown>>(`select * from security_policy where id = true`);
+  const [telemetry] = await db.query<{ enabled: boolean }>(`select enabled from telemetry_state where id = true`);
+  const [owner] = await db.query<{ email: string; username: string }>(
+    `select email, username from users where role = 'super_admin' limit 1`,
+  );
+
+  return {
+    owner: owner ? { email: owner.email, username: owner.username } : null,
+    deployment: deployment
+      ? {
+          domain: deployment.domain,
+          tlsMode: deployment.tls_mode,
+          acmeEmailSet: !!deployment.acme_email,
+          // Honest: a certificate has not been obtained during setup.
+          certificateVerified: !!deployment.certificate_verified_at,
+        }
+      : null,
+    llm: llm
+      ? {
+          provider: llm.provider,
+          model: llm.model,
+          baseUrl: llm.base_url,
+          apiKeySet: !!llm.api_key_enc,
+          externalAcknowledged: llm.external_acknowledged,
+          probeSteps: Array.isArray(llm.probe_steps) ? llm.probe_steps : [],
+        }
+      : null,
+    smtp: smtp.map((p) => ({
+      kind: p.kind,
+      copyFromSystem: p.copy_from_system,
+      host: p.copy_from_system ? null : p.host,
+      port: p.copy_from_system ? null : p.port,
+      security: p.copy_from_system ? null : p.security,
+      username: p.copy_from_system ? null : p.username,
+      passwordSet: p.copy_from_system ? null : !!p.password_enc,
+      fromName: p.from_name,
+      fromAddress: p.from_address,
+    })),
+    connectors: connectors.map((c) => ({
+      provider: c.provider,
+      // A client ID is not a secret — it appears in the consent URL the user
+      // sees — but it is still an identifier, so only its presence is shown.
+      clientIdSet: !!c.client_id,
+      // Shown in full: an operator has to compare it character for character
+      // against what they registered with the provider, and a mismatch here is
+      // the single most common connector failure.
+      redirectUri: c.redirect_uri,
+    })),
+    security: policy
+      ? {
+          localFileAccess: policy.local_file_access_enabled,
+          folderMapping: policy.folder_mapping_enabled,
+          folderSharing: policy.folder_sharing_enabled,
+          workspaceWideSharing: policy.workspace_wide_sharing_enabled,
+          ocr: policy.ocr_enabled,
+          clamav: policy.clamav_enabled,
+          auditRetentionDays: policy.audit_retention_days,
+        }
+      : null,
+    telemetry: { enabled: telemetry?.enabled ?? false },
+    mailAccount: await (async () => {
+      const chosen = await systemMailAccount(db);
+      return chosen ? { provider: chosen.provider, email: chosen.accountEmail, fromName: chosen.fromName, active: chosen.active } : null;
+    })(),
+    reminders: [
+      'Back up the installation master key separately. A database backup alone cannot restore your saved credentials.',
+    ],
+  };
+}

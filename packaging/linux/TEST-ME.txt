@@ -1,0 +1,14 @@
+JOSI SERVER FOR LINUX - ACCEPTANCE
+
+For x86_64 machines running Arch, or Debian 12+ / Ubuntu 22.04+. The packages
+are not signed with a distribution key; the one-command installer verifies
+each package by SHA-256.
+
+  1. Run: curl -fsSL https://<install host>/linux | sudo bash
+  2. It prints one line, the address to open. Open it from another computer
+     within ten minutes (rerun the command for a fresh one) and finish setup.
+  3. Restart the machine. Run: systemctl status josi 'josi-ce-*'
+  4. Sign in with the authenticator code, choose a model, send a message.
+  5. sudo josi-uninstall, then the install command again: the data is back.
+
+If something fails, keep /var/lib/josi/transactions and /var/log/josi-install.log.

@@ -1,0 +1,122 @@
+// Josi CE API entrypoint.
+import { josiArchiveWriter, pgRestoreReader } from '@josi-ce/ops';
+import { apiListenHost, connectFromEnv, loadMasterKey, createNativeInspectionRuntime, installCrashHandlers, importQueuedReports, resolveDataPath } from '@josi-ce/core';
+import { attachmentRoot, probeAttachmentStorage, reconcileWorkspaceMount } from '@josi-ce/storage';
+import { createApp } from './app.js';
+import type { CookieSecurePolicy } from './http/cookies.js';
+import { publicAddressFromEnvironment, reconcilePublicAddress } from './setup/publicAddress.js';
+import { RelayService } from './relay/relayService.js';
+
+const attachmentStorage = await probeAttachmentStorage();
+if (!attachmentStorage.ok) console.error(`josi-ce: ${attachmentStorage.code}: ${attachmentStorage.message}`);
+
+const PORT = Number(process.env.PORT ?? 8080);
+
+const { db, close, describe } = await connectFromEnv();
+console.log(`josi-ce: database ${describe}`);
+// A crash in this process becomes a scrubbed report for the owner (see crashReport.ts).
+installCrashHandlers('api', () => db);
+void importQueuedReports(db, 'api').catch(() => undefined);
+
+// Load the key once at boot so a misconfigured installation fails immediately
+// and visibly, rather than at the first request that needs to decrypt something.
+// The value is never logged — MasterKey redacts itself on inspection.
+let installationKey: ReturnType<typeof loadMasterKey> | null = null;
+try {
+  installationKey = loadMasterKey();
+  console.log('josi-ce: master key loaded');
+} catch (err) {
+  console.error(`josi-ce: ${(err as Error).message}`);
+  console.error('josi-ce: refusing to start without a usable master key');
+  await close();
+  process.exit(1);
+}
+
+// The real backup path. `pgBackupWriter` shells out to pg_dump, which ships in
+// the runtime image; the password is read from its file here and handed to the
+// child through protected native files (or the existing container environment).
+const pgConn = {
+  host: process.env.PGHOST ?? 'db',
+  port: Number(process.env.PGPORT ?? 5432),
+  user: process.env.POSTGRES_USER ?? 'josi',
+  database: process.env.POSTGRES_DB ?? 'josi',
+  passwordFile: process.env.PGPASSWORD_FILE,
+  password: process.env.PGPASSWORD_FILE ? undefined : process.env.PGPASSWORD,
+  toolsDirectory: process.env.JOSI_PG_BIN,
+};
+
+const appUrl = (process.env.APP_URL ?? '').replace(/\/$/, '') || 'http://localhost:8080';
+// Readiness is the network controller's commit boundary.  Reconcile all
+// persisted address derivatives before listening so a failure rolls the whole
+// runtime change back instead of leaving Caddy and the database disagreeing.
+await reconcilePublicAddress(db, publicAddressFromEnvironment(appUrl));
+const workspaceMount = await reconcileWorkspaceMount(db);
+if (workspaceMount.status === 'unavailable') {
+  console.error('josi-ce: configured workspace mount is unavailable; no workspace access was granted');
+} else if (workspaceMount.status === 'ready') {
+  console.log(`josi-ce: workspace mount ready (${workspaceMount.writable ? 'read/write' : 'read-only'})`);
+}
+const cookieSecure: CookieSecurePolicy = process.env.COOKIE_SECURE === 'true'
+  ? true
+  : process.env.COOKIE_SECURE === 'false'
+    ? false
+    : new URL(appUrl).protocol === 'https:' ? 'auto' : false;
+
+// Off unless this server is linked or set to its own relay: a fresh install opens
+// no listener and contacts nothing.
+const relay = new RelayService({ db, apiPort: PORT,
+  hostedUrl: process.env.JOSI_HOSTED_URL || undefined, hostedPublicKey: process.env.JOSI_HOSTED_PUBLIC_KEY || undefined,
+  lanPort: process.env.JOSI_LAN_NOISE_PORT ? Number(process.env.JOSI_LAN_NOISE_PORT) : undefined });
+
+const app = createApp(db, {
+  relay,
+  automationRuntime: installationKey ? createNativeInspectionRuntime(db, installationKey) : undefined,
+  attachmentStorageRoot: attachmentRoot(),
+  // Empty/unset follows APP_URL. This keeps first-run LAN HTTP usable without
+  // weakening cookies on a public HTTPS installation. An explicit value is an
+  // advanced override, not something the normal installer should require.
+  cookieSecure,
+  appUrl,
+  trustedProxies: process.env.JOSI_TRUSTED_PROXIES,
+  // Sign in with Apple is on for every server: the Josi iPhone app's own id is
+  // the audience. APPLE_NATIVE_CLIENT_ID=off turns it off; another value is
+  // for a privately built app.
+  appleNativeClientId: process.env.APPLE_NATIVE_CLIENT_ID === 'off' ? null
+    : process.env.APPLE_NATIVE_CLIENT_ID || 'com.socalreceptionist.josice',
+  passkeysEnabled: process.env.JOSI_PASSKEYS !== 'off',
+  emailCodesEnabled: process.env.JOSI_EMAIL_CODES !== 'off',
+  appleWebSignInUrl: process.env.APPLE_WEB_SIGNIN_URL || null,
+  webDir: process.env.WEB_DIR,
+  // One file with everything important (item 42): the dump, the chat
+  // attachments and a manifest, optionally sealed with a passphrase.
+  backupWriter: josiArchiveWriter(pgConn, { attachmentsDir: attachmentRoot(), version: process.env.JOSI_VERSION ?? '0.1.0',
+    masterKeyFile: process.env.JOSI_LINUX_SERVER === '1' ? (process.env.MASTER_KEY_FILE ?? null) : null, keysDir: resolveDataPath('/data/keys'), versionsDir: resolveDataPath('/data/versions'),
+    installationId: async () => (await db.query<{ install_id: string }>(`select install_id from install_identity where id = true`))[0]?.install_id ?? null }),
+  restoreReader: pgRestoreReader(pgConn),
+  // M115: no gateway ships. An operator who wants one sets it.
+  supportGatewayUrl: process.env.JOSI_SUPPORT_GATEWAY || null,
+  setupTokenSha256: process.env.JOSI_SETUP_TOKEN_SHA256 || null,
+  openSetup: process.env.JOSI_OPEN_SETUP === '1',
+});
+
+// The native proxy is the only public listener. Container network isolation
+// retains its existing behavior on other platforms.
+const listenHost = apiListenHost();
+const server = listenHost
+  ? app.listen(PORT, listenHost, () => console.log(`josi-ce api on loopback :${PORT}`))
+  : app.listen(PORT, () => console.log(`josi-ce api on :${PORT}`));
+
+await relay.start().catch(err => console.error(`josi-ce: relay did not start: ${(err as Error).message}`));
+
+/** Stop accepting connections, drain, then close the pool. Without this a
+ * `docker compose up -d` redeploy cuts requests off mid-flight. */
+async function shutdown(signal: string): Promise<void> {
+  console.log(`josi-ce: ${signal} received, shutting down`);
+  await relay.stop().catch(() => undefined);
+  server.close(() => void 0);
+  await close().catch(() => undefined);
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));

@@ -1,0 +1,55 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { resolve, dirname, join } from 'node:path';
+import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
+const root=process.argv[2],mode=process.argv[3];
+assert(root.startsWith('/Users/roman/Documents/Josi Mac Native/JosiDrive/BuildTemp/josi-ce-native-macos-20261009/tmp/port/tests/')||root.startsWith(`/private/tmp/josi-ce-native-tests-${process.getuid()}/`));
+assert.equal(JSON.parse(readFileSync(join(root,'data/isolated-test.json'))).purpose,'disposable-native-acceptance');
+const program=resolve(dirname(process.execPath),'../..'),require=createRequire(join(program,'app/package.json'));
+const postgres=require('postgres'),cfg=JSON.parse(readFileSync(join(root,'data/config/runtime.json')));
+const sql=postgres({host:'127.0.0.1',port:cfg.databasePort,username:'josi',database:'josi',password:readFileSync(join(root,'data/secrets/web/database-password'),'utf8'),max:1,onnotice:()=>{}});
+try {
+  if(mode==='seed') {
+    await sql`insert into users(email,username,role) values('native-workspace@example.test','fixture_owner','super_admin')`;
+  } else if(mode==='verify') {
+    const [row]=await sql`select m.id,m.owner_user_id,r.container_path,r.writable,r.enabled from folder_mappings m join storage_roots r on r.id=m.root_id where r.container_path='/workspace'`;
+    assert(row && row.enabled && !row.writable);
+    Object.assign(process.env,{JOSI_NATIVE_RUNTIME:'1',JOSI_WORKSPACE_ENABLED:'1',JOSI_WORKSPACE_NATIVE_PATH:cfg.workspace.path,JOSI_WORKSPACE_NATIVE_ID:`${cfg.workspace.dev}:${cfg.workspace.ino}`,JOSI_STORAGE_ROOT_BASE:join(root,'data/roots')});
+    const {workspaceRead,workspaceChange}=await import(pathToFileURL(join(program,'app/packages/storage/dist/localWorkspace.js')));
+    const db={query:(text,args=[])=>sql.unsafe(text,args)};
+    const file=await workspaceRead(db,row.owner_user_id,row.id,'chosen.txt');assert.equal(file.data.toString(),'selected native folder');
+    await assert.rejects(workspaceChange(db,row.owner_user_id,row.id,{operation:'create',path:'unauthorized.txt',content:'refuse'}),/not authorized/);
+    console.log('PASS real native server /workspace mapping, selected-folder read and write refusal');
+    const { subscriptionEnvironment }=await import(pathToFileURL(join(program,'app/native/SubscriptionEnvironment.mjs')));
+    const llm=await import(pathToFileURL(join(program,'app/packages/llm/dist/index.js')));
+    const data=join(root,'data');
+    const env={...subscriptionEnvironment(program,data,'web'),JOSI_NATIVE_RUNTIME:'1',JOSI_NATIVE_ISOLATED_ROOT:data,JOSI_DATA_DIR:data,
+      JOSI_STORAGE_ROOT_BASE:join(data,'roots'),JOSI_WORKSPACE_ENABLED:'1',JOSI_WORKSPACE_MODE:'ro',
+      JOSI_WORKSPACE_NATIVE_PATH:cfg.workspace.path,JOSI_WORKSPACE_NATIVE_ID:`${cfg.workspace.dev}:${cfg.workspace.ino}`,
+      DATABASE_URL:`postgresql://josi@127.0.0.1:${cfg.databasePort}/josi`,PGPASSWORD_FILE:join(data,'secrets/web/database-password')};
+    for(const provider of ['codex','claude']) {
+      const session=llm.openHarnessSession({serverPath:env.JOSI_MCP_SERVER,tools:[{name:'workspace_read',description:'test',parameters:{}}],toolContext:{userId:row.owner_user_id,sessionKey:'native-mcp-proof'},env});
+      try {
+        let config;
+        if(provider==='codex') {
+          const args=llm.codexArgs('test',session),overrides=args.flatMap((arg,i)=>arg==='-c'?['-c',args[i+1]]:[]);
+          config=JSON.parse(execFileSync('codex',[...overrides,'mcp','get','josi','--json'],{env:{PATH:env.PATH,HOME:env.HOME,CODEX_HOME:env.CODEX_HOME,TMPDIR:join(data,'temp/web')},encoding:'utf8',timeout:15000})).transport;
+        } else config=JSON.parse(readFileSync(llm.writeClaudeMcpConfig(session))).mcpServers.josi;
+        // Emulate the vendor's cleared environment: only explicit MCP config
+        // can restore native folder identity and the protected secret reader.
+        const result=execFileSync(config.command,config.args,{env:{PATH:env.PATH,HOME:env.HOME,TMPDIR:join(data,'temp/web'),...config.env},encoding:'utf8',timeout:20000,
+          input:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'workspace_read',arguments:{mapping_id:row.id,path:'chosen.txt'}}})+'\n'});
+        const reply=JSON.parse(result.trim()),outcome=JSON.parse(reply.result.content[0].text);
+        assert.equal(reply.result.isError,false,JSON.stringify(outcome));
+        assert.equal(outcome.text,'selected native folder');
+        assert.equal(llm.readExecutedCalls(session.callsPath)[0].result.text,'selected native folder');
+      } finally { session.cleanup(); }
+    }
+    console.log('PASS real selected-folder read through Codex and Claude MCP configurations with cleared environment and protected native database password');
+  } else if(mode==='declined') {
+    assert.equal((await sql`select count(*)::int as n from storage_roots where container_path='/workspace' and enabled=true`)[0].n,0);
+    console.log('PASS real server workspace decline disables discovery');
+  } else throw Error('Unknown test mode');
+} finally { await sql.end(); }

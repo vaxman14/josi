@@ -1,0 +1,2 @@
+FROM /model/josi-qwen3.5-9b-v6-Q4_K_M.gguf
+PARAMETER num_ctx 24576

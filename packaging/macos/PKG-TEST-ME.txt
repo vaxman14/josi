@@ -1,0 +1,90 @@
+Josi Server — physical acceptance candidate
+
+Use a separate Apple Silicon Mac with macOS 14 or later and at least 6 GB
+free space. Keep existing Josi data and recovery copies. Allow several minutes.
+Do not disable Gatekeeper globally. Check the accompanying candidate status
+and checksums for signing and notarization results before physical testing.
+
+macos.18 Doctor acceptance: After installation, open Admin > System checkup.
+Confirm that Mac installation, database, local address, worker and speech checks
+show real results without a missing-helper or Docker warning. If no full backup
+has been created in Josi, Backup history should show Attention. The update card
+should show the installed macos.18 version and explain the signed installer
+update path. Check system should refresh the report. Service repairs still
+require the signed installer and macOS approval.
+
+Selected-folder acceptance: Open Local Workspace and click Refresh folders.
+The installer-selected folder should appear and a single connection should be
+selected automatically. If a retained root is not yet connected, review the
+scope and click Connect folder. If Mac access is unavailable, the page should
+explain it. Ask the AI to list and read a harmless file in that folder; it must
+use the authorized workspace tools and must not describe its application folder
+as your selected workspace. Writes remain unavailable for the native read-only
+selection. Revoked permissions and paused connections must remain revoked/paused.
+
+1. Server only: Open the DMG and double-click Install Josi.pkg. Read Introduction.
+   Use Customize to leave Desktop Client unchecked. Confirm the startup disk
+   and authorize Installer with a Mac administrator account. The Josi progress
+   window should show the current task and elapsed seconds. Open Josi stays
+   disabled until installation completes and services are ready.
+2. Folder: In Josi Server, choose a folder you own that the server can read.
+   A native folder chooser should appear. The connection is read only and
+   appears in Josi as /workspace after owner setup. Confirm the explicit
+   read-only folder grant. Check that private parents receive search only,
+   write permissions stay unchanged, and unrelated ACL entries remain.
+   macOS privacy denials must be reported with copyable diagnostics. Change
+   folders, then select No Folder Access and check that added grants and
+   discovery/access stop. The chosen folder is never deleted.
+3. Launch: Click Open Josi in Browser and complete owner setup. Verify a
+   single-use setup link, the selected /workspace content and read-only limits.
+   Upload a harmless document, confirm its extracted text, and index/search it.
+   Test OCR with a scanned image. No separate scanner is required on macOS.
+   Subscription models: Choose ChatGPT or Claude subscription and verify that
+   the bundled CLI is installed but signed out. Complete the vendor browser
+   sign-in yourself, test the model, then verify the connection after restart
+   and upgrade. Enable Codex device login in ChatGPT security settings if needed.
+4. Restart: Restart the Mac. Open /Applications/Josi Server.app and verify
+   ready status, browser access, chosen folder and retained owner/data.
+5. Server + client: On another clean acceptance Mac, select Desktop Client in
+   Customize. Verify /Applications/Josi CE.app is separate. Launch it and
+   connect to http://localhost:8080. Confirm login and real client operation.
+   If a desktop client is already installed, deselect this component to keep it.
+6. Upgrade: On an acceptance Mac with an earlier supported native server,
+   save a harmless sentinel and owner settings. Install this PKG, then check
+   the sentinel, settings, workspace and startup. Never reuse production data
+   for injected failure tests. Same-version reruns are repair installs.
+7. Uninstall: Open Uninstall Josi from Applications, Josi Server, or the DMG.
+   Keep my data removes both apps and automatic startup, disconnects folder
+   access, and retains data for reinstalling. Complete removal permanently
+   deletes Josi data, sign-ins, recovery copies, service accounts, client
+   caches and receipts. Workspace files remain. Confirm once, authorize
+   locally in macOS, and wait for Removal verified. Administrator elevation
+   is temporary. macOS may separately require Full Disk Access to remove
+   service users. If blocked, use Open Full Disk Access Settings and Show
+   This App in Finder, add this exact app with + and enable it yourself,
+   then quit/reopen it and retry the same removal choice. Full Disk Access
+   is broad permission and stays enabled until you turn it off in Settings;
+   it is not granted or revoked automatically. After removal, turn it off
+   or remove the Uninstall Josi entry. Retry the same choice if cleanup is
+   interrupted. Before a fresh-install test, clear Josi browser
+   site data for localhost:8080 (and 127.0.0.1 if used). Actual browser data is
+   not deleted by the app. Keychain cleanup targets only the desktop Safe
+   Storage entry; signing certificates and josi-notary remain.
+8. Recovery: Rerunning this package automatically handles verified interrupted
+   installations. Before activation it can restore a verified safety copy or
+   retain incomplete fresh setup and retry. After activation it preserves the
+   current database and settings, then continues with an upgrade or repair.
+   Recovery evidence remains in the product's transactions folder. It never
+   deletes user data, the selected workspace folder, or existing snapshots.
+   Damaged records, changed ownership, or ambiguous data still require review.
+9. Failure: If installation fails, use Copy Diagnostics in the progress window.
+   Also inspect /Library/Logs/Josi CE Server/Install-*.jsonl or use Installer’s
+   Window > Installer Log. The output must identify verification vs installation
+   and the cause. An upgrade failure before activation may restore the old
+   version automatically; after activation, data is retained and recovery must
+   refuse to discard possible new writes. Do not keep clicking install after
+   an unresolved failure. Save diagnostics first.
+
+This candidate's physical acceptance remains unproven. Earlier candidates have
+failed on this Mac; their logs and data remain available for recovery.
+Record PASS/FAIL for each step, OS version and exact candidate checksum.

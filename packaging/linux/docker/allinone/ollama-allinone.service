@@ -1,0 +1,21 @@
+[Unit]
+Description=Ollama with the Josi model baked in
+After=network.target
+
+[Service]
+# GPU settings given to the container (see josi-allinone-entry); the lines below win over it.
+EnvironmentFile=-/etc/ollama-allinone.env
+Environment=HOME=/root
+Environment=OLLAMA_HOST=127.0.0.1:11434
+Environment=OLLAMA_KEEP_ALIVE=-1
+Environment=OLLAMA_MODELS=/root/.ollama/models
+ExecStart=/usr/bin/ollama serve
+Restart=no
+# If Ollama ever stops, the container stops, so Docker restarts all of it.
+SuccessAction=exit
+FailureAction=exit
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,270 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Controls;
+
+namespace Josi.Native {
+  /// Small per-PC app preferences, kept in %LOCALAPPDATA%\Josi\settings.json.
+  /// Not secrets: those live in Windows Credential Manager or the server Vault.
+  static class LocalSettings {
+    static string File { get { return Path.Combine(AppLinks.StateDirectory,
+      AppLinks.Testing ? "settings-test" + AppLinks.Instance + ".json" : "settings.json"); } }
+    static Dictionary<string, object> Read() {
+      try { var value = Wires.Parse(System.IO.File.ReadAllText(File)).Raw as Dictionary<string, object>; if (value != null) return value; } catch (Exception) { }
+      return new Dictionary<string, object>();
+    }
+    public static string Get(string key, string fallback = "") { object value; return Read().TryGetValue(key, out value) && value is string ? (string)value : fallback; }
+    public static void Set(string key, string value) {
+      var all = Read(); all[key] = value;
+      Directory.CreateDirectory(Path.GetDirectoryName(File));
+      System.IO.File.WriteAllText(File, Wires.Serialize(all));
+    }
+  }
+
+  /// Administrator: workspace name, time zone (automatic from Windows by
+  /// default, or pinned to a zone you choose) and anonymous usage counts.
+  public sealed class WorkspaceSettingsView : SectionView {
+    Wire workspace = Wire.Null, telemetry = Wire.Null;
+    readonly TextBox name = Ui.Input("Workspace name");
+    readonly ComboBox zone;
+    readonly List<KeyValuePair<string, string>> zones = TimeZones.All();
+    string mode;
+    public WorkspaceSettingsView(AppModel model, Window owner) : base(model, owner) {
+      zone = Ui.Choice(zones.Select(z => new KeyValuePair<string, string>(z.Key, z.Value + "  (" + z.Key + ")")).ToList(), TimeZones.Local());
+      mode = model.WorkspaceZoneMode;
+    }
+    protected override async Task Load() {
+      var api = Api; var stamp = Stamp;
+      var w = await api.Request("/admin/workspace");
+      Wire t; try { t = await api.Request("/ops/admin/telemetry"); } catch (JosiException) { t = Wire.Null; }
+      if (!Current(stamp)) return;
+      workspace = w["workspace"]; telemetry = t;
+      if (!workspace.IsNull) {
+        name.Text = workspace["name"].Text;
+        var saved = workspace["timezone"].Text;
+        if (zones.Any(z => z.Key == saved)) zone.SelectedValue = saved;
+      }
+    }
+    protected override UIElement Build() {
+      var page = Page(Ui.HeadingWith("Workspace", null, Ui.Pill("Refresh", StartLoad)));
+      if (workspace.IsNull) {
+        if (loading) { Ui.Add(page, Ui.Secondary("Loading…"), 0); return page; }
+        Ui.Add(page, Ui.CardBox("No workspace yet", Ui.Secondary("This installation has no workspace record. Recover it from the administrator and deployment settings already saved here."),
+          Ui.Pill("Recover Workspace", () => Perform(async (api, stamp) => await api.Request("/admin/workspace/recover", "POST", Wires.O())), true)), 0);
+        return page;
+      }
+      Ui.Detach(name); Ui.Detach(zone);
+      var items = new List<UIElement> { Ui.Field("Name", name), Ui.Headline("Time zone"),
+        Ui.Segments(Ui.Options("auto", "Automatic from Windows", "pinned", "Pinned"), mode, v => { mode = v; Render(); }) };
+      if (mode == "auto") items.Add(Ui.Caption("Follows this PC's Windows time zone: " + TimeZoneInfo.Local.DisplayName + " (" + TimeZones.Local() + "). Josi updates the workspace when Windows' zone changes, each time you open Josi here."));
+      else { items.Add(zone); items.Add(Ui.Caption("Stays on this zone whatever Windows is set to.")); }
+      items.Add(Ui.Caption("Saved on the server: " + workspace["timezone"].Text));
+      items.Add(Ui.Pill("Save", () => {
+        var tz = mode == "auto" ? TimeZones.Local() : Ui.Selected(zone);
+        var body = Wires.O("name", name.Text.Trim(), "timezone", tz); var chosen = mode;
+        Perform(async (api, stamp) => { var r = await api.Request("/admin/workspace", "PATCH", body); workspace = r["workspace"]; model.WorkspaceZoneMode = chosen; note = "Saved."; });
+      }, true));
+      Ui.Add(page, Ui.CardBox("Business profile", items.ToArray()), 0);
+      if (!telemetry.IsNull) {
+        var on = telemetry["enabled"].Flag;
+        var t = new List<UIElement> { Ui.Secondary(telemetry["disclosure"].Text.Length > 0 ? telemetry["disclosure"].Text : "Optional anonymous usage counts. Never conversations, credentials or business content."),
+          Ui.Row(10, ModelText.Pill(on ? "On" : "Off", on), Ui.Pill(on ? "Turn Off" : "Turn On", () => Perform(async (api, stamp) => await api.Request("/ops/admin/telemetry", "PUT", Wires.O("enabled", !on))))) };
+        if (telemetry["last_sent_at"].Text.Length > 0) t.Add(Ui.Caption("Last sent " + Wires.Date(telemetry["last_sent_at"].Text) + " · " + telemetry["last_status"].Text));
+        if (!telemetry["lastPayload"].IsNull) t.Add(new Disclosure("Exactly what was last sent", () => Ui.Copyable(telemetry["lastPayload"].Json, 12.5, null, true)));
+        Ui.Add(page, Ui.CardBox("Anonymous usage counts", t.ToArray()), 0);
+      }
+      Ui.Add(page, Ui.CardBox("Name and identity", Ui.Caption("Josi CE is created and published by SOCAL RECEPTIONIST LLC. The code is licensed under the AGPL; you may modify and redistribute it. The Josi name and marks are separate from that licence: a modified version should carry your own identity. The full policy is in TRADEMARK.md.")), 0);
+      Ui.Add(page, Note(), 0);
+      return page;
+    }
+  }
+
+  /// Administrator: what still has to be done on this installation. Every
+  /// item comes from what the installation contains, except the master-key
+  /// backup, which Josi cannot observe.
+  public sealed class ChecklistView : SectionView {
+    Wire data = Wire.Null;
+    public ChecklistView(AppModel model, Window owner) : base(model, owner) { }
+    protected override async Task Load() {
+      var api = Api; var stamp = Stamp;
+      try { await api.Request("/admin/launch-checklist/seen", "POST", Wires.O()); } catch (JosiException) { }
+      var d = await api.Request("/admin/launch-checklist"); if (Current(stamp)) data = d;
+    }
+    static string Section(string href) {
+      if (string.IsNullOrEmpty(href)) return null;
+      var map = new[] { new[] { "backup", "backups" }, new[] { "model", "models" }, new[] { "people", "people" }, new[] { "user", "people" }, new[] { "mail", "mail-settings" }, new[] { "smtp", "mail-settings" },
+        new[] { "connector", "connectors" }, new[] { "connection", "connections" }, new[] { "vault", "vault" }, new[] { "channel", "channels" }, new[] { "telegram", "channels" }, new[] { "voice", "voice-box" },
+        new[] { "storage", "storage" }, new[] { "network", "network" }, new[] { "workspace", "workspace" }, new[] { "policy", "policy" }, new[] { "diagnostic", "server" }, new[] { "security", "account" }, new[] { "mfa", "account" } };
+      foreach (var m in map) if (href.IndexOf(m[0], StringComparison.OrdinalIgnoreCase) >= 0) return m[1];
+      return null;
+    }
+    protected override UIElement Build() {
+      var page = Page(Ui.HeadingWith("Getting Started", null, Ui.Pill("Refresh", StartLoad)));
+      if (data.IsNull) { Ui.Add(page, Ui.Secondary(loading ? "Loading…" : "The checklist has not loaded."), 0); return page; }
+      var done = data["progress"]["done"].Integer; var total = data["progress"]["total"].Integer;
+      Ui.Add(page, Ui.Stack(10, Ui.Secondary("Josi is installed. These are the things only you can do: " + done + " of " + total + " settled."),
+        new ProgressBar { Height = 6, Maximum = Math.Max(1, total), Value = done }), 0);
+      var reminders = data["reminders"].List;
+      if (reminders.Count > 0) Ui.Add(page, Ui.CardBox("Do these before you rely on this installation", reminders.Select(r => (UIElement)Ui.T("• " + r["label"].Text)).ToArray()), 0);
+      foreach (var g in new[] { new[] { "critical", "Protect this installation" }, new[] { "important", "Finish essential setup" }, new[] { "optional", "Optional capabilities" } }) {
+        var items = data["items"].List.Where(i => i["severity"].Text == g[0]).ToList();
+        if (items.Count == 0) continue;
+        var settled = items.Count(i => i["state"].Text == "done" || i["state"].Text == "dismissed" || i["state"].Text == "unavailable");
+        var attention = items.Any(i => i["state"].Text == "failed" || (g[0] == "critical" && i["state"].Text == "outstanding"));
+        Ui.Add(page, new Disclosure(g[1] + " · " + settled + " of " + items.Count + " settled" + (attention ? " · needs attention" : ""), () => {
+          var list = Ui.Stack(0);
+          foreach (var item in items) {
+            var key = item["key"].Text; var state = item["state"].Text; var section = Section(item["href"].Text);
+            if (list.Children.Count > 0) list.Children.Add(Ui.Divider());
+            var row = Ui.Stack(6, Ui.Spread(Ui.T(item["label"].Text, 14.5, FontWeights.SemiBold), ModelText.Pill(state == "done" ? "Done" : state == "outstanding" ? "To do" : state == "failed" ? "Not working" : state == "dismissed" ? "Put aside" : "Not available here", state == "done")),
+              Ui.Caption(item["why"].Text));
+            row.Margin = new Thickness(0, 10, 0, 10);
+            if (item["href"].Text.Length == 0 && (state == "outstanding" || state == "failed") && item["insteadOfScreen"].Text.Length > 0) row.Children.Add(Ui.Caption(item["insteadOfScreen"].Text));
+            if (item["detail"].Text.Length > 0) row.Children.Add(Ui.Caption(item["detail"].Text));
+            var actions = Ui.Wrap();
+            if (state == "outstanding" || state == "failed") {
+              if (key == "master_key_backup") actions.Children.Add(Ui.Pill("I Have Copied It Somewhere Safe", () => Perform(async (api, stamp) => await api.Request("/admin/launch-checklist/master-key-backed-up", "POST", Wires.O())), true));
+              else if (section != null) actions.Children.Add(Ui.Pill("Do This", () => { model.Section = section; }, true));
+            }
+            if (item["dismissible"].Flag && state == "outstanding") actions.Children.Add(Ui.Pill("Skip", () => Perform(async (api, stamp) => await api.Request("/admin/launch-checklist/dismiss/" + Uri.EscapeDataString(key), "POST", Wires.O()))));
+            if (state == "dismissed") actions.Children.Add(Ui.Pill("Put It Back on the List", () => Perform(async (api, stamp) => await api.Request("/admin/launch-checklist/restore/" + Uri.EscapeDataString(key), "POST", Wires.O()))));
+            if (actions.Children.Count > 0) { actions.Margin = new Thickness(0, 4, 0, 0); row.Children.Add(actions); }
+            list.Children.Add(row);
+          }
+          return Ui.CardBox(null, list);
+        }, attention), 0);
+      }
+      Ui.Add(page, Ui.Caption("You can come back to this from the sidebar at any time. Nothing here expires."), 0);
+      return page;
+    }
+  }
+
+  /// Administrator: change LAN, public domain, reverse proxy, HTTPS and port
+  /// settings through the server's protected maintenance controller, which
+  /// previews the change, checks health at the new address and restores the
+  /// previous configuration if it fails.
+  public sealed class NetworkView : SectionView {
+    readonly PasswordBox password = Ui.Secret("Your current administrator password");
+    readonly TextBox publicUrl = Ui.Input("https://name-or-ip:8080");
+    Wire launch = Wire.Null, network = Wire.Null;
+    bool urlLoaded;
+    public NetworkView(AppModel model, Window owner) : base(model, owner) { }
+    protected override void OnLeave() { password.Clear(); }
+    protected override async Task Load() {
+      var api = Api; var stamp = Stamp;
+      try { var n = await api.Request("/admin/network"); if (Current(stamp)) { network = n; if (!urlLoaded) { publicUrl.Text = n["configuredUrl"].Text.Length > 0 ? n["configuredUrl"].Text : n["publicUrl"].Text; urlLoaded = true; } } }
+      catch (JosiException e) { if (e.Status != 404) throw; }
+    }
+    /// Item 36: where this server answers, and the address other devices use.
+    UIElement Addresses() {
+      if (network.IsNull) return Ui.CardBox("Addresses", Ui.Secondary(loading ? "Loading…" : "This server does not report its addresses."));
+      var mode = network["mode"].Text;
+      var items = new List<UIElement> {
+        Ui.Spread(Ui.Stack(2, Ui.Headline("Public address"), Ui.Caption(mode == "local" ? "Only this PC reaches Josi." : mode == "lan" ? "This PC and your network, over HTTPS with Josi's own certificate." : mode == "tailscale" ? "Your devices over Tailscale, over HTTPS with Josi's own certificate." : "A public domain, served through your tunnel or reverse proxy.")),
+          Ui.Copyable(network["publicUrl"].Text, 14, null, true)) };
+      if (network["restartNeeded"].Flag) items.Add(Ui.T("The saved address (" + network["configuredUrl"].Text + ") differs from the running one. Restart the server to apply it.", 13.5, null, Ui.Accent));
+      var lan = network["lan"].List;
+      if (lan.Count > 0) {
+        var rows = Ui.Stack(4);
+        foreach (var a in lan) rows.Children.Add(Ui.Row(10, Ui.Caption(a["name"].Text), Ui.Copyable("https://" + a["address"].Text + ":" + network["port"].Integer, 13, null, true)));
+        items.Add(Ui.Stack(4, Ui.Headline("This PC on the network"), Ui.Caption("Other devices reach this server at one of these once the public address is set to it."), rows));
+      }
+      if (!network["certificate"].IsNull) items.Add(Ui.Stack(2, Ui.Headline("Certificate fingerprint"),
+        Ui.Caption("The authority this server's proxy issues its LAN certificate from. The Josi app on another PC shows the same fingerprint before you trust it."), Ui.Copyable(network["certificate"]["fingerprint"].Text, 12, null, true)));
+      return Ui.CardBox("Addresses", items.ToArray());
+    }
+    /// Tailscale: the phone or another PC reaches this server anywhere, with
+    /// no public domain and no port forwarding. Josi does not install
+    /// Tailscale; the person installs it on the server and on each device and
+    /// signs both in to the same account. Josi then offers the server's
+    /// Tailscale name as the public address, served like a LAN one.
+    UIElement Tailscale() {
+      if (network.IsNull) return null;
+      var ts = network["tailscale"];
+      var items = new List<UIElement> { Ui.Caption("Reach Josi from your phone or another PC anywhere, with no public domain and no port forwarding. Install Tailscale on this PC and on each device, sign them all in to the same Tailscale account, and use this server's Tailscale address.") };
+      if (ts.IsNull || !ts["installed"].Flag) {
+        items.Add(Ui.Secondary("Tailscale is not installed on this PC. Get it from tailscale.com/download, sign in, then press Refresh above."));
+        return Ui.CardBox("Tailscale", items.ToArray());
+      }
+      if (!ts["running"].Flag) {
+        items.Add(Ui.Secondary(ts["error"].Text.Length > 0 ? ts["error"].Text : "Tailscale is installed but not connected (" + (ts["state"].Text.Length > 0 ? ts["state"].Text : "stopped") + "). Open Tailscale, sign in, then press Refresh above."));
+        return Ui.CardBox("Tailscale", items.ToArray());
+      }
+      var url = network["tailscaleUrl"].Text;
+      var who = ts["loginName"].Text.Length > 0 ? ts["loginName"].Text : "your account";
+      items.Add(Ui.Secondary("Connected as " + who + (ts["tailnet"].Text.Length > 0 ? " on " + ts["tailnet"].Text : "") + "."));
+      items.Add(Ui.Stack(2, Ui.Headline("This server's Tailscale address"), Ui.Copyable(url, 14, null, true)));
+      var ips = ts["ips"].List;
+      if (ips.Count > 0) items.Add(Ui.Caption("Tailscale IP: " + string.Join(", ", ips.Select(ip => ip.Text))));
+      if (network["mode"].Text == "tailscale" && network["publicUrl"].Text == url) {
+        items.Add(Ui.Secondary("This is the public address now. On your phone, install Tailscale, sign in to the same account, and give the Josi app this address. The app shows the certificate fingerprint once; compare it with the one above."));
+      } else {
+        var use = Ui.Pill("Use the Tailscale Address", () => {
+          SaveAddress(url);
+        }, true);
+        use.IsEnabled = network["editable"].Flag;
+        items.Add(use);
+        items.Add(Ui.Caption("Sets the public address to the Tailscale name on the current port. Restart the server afterwards. Devices on the same network keep working through Tailscale too."));
+      }
+      return Ui.CardBox("Tailscale", items.ToArray());
+    }
+    void SaveAddress(string value) {
+      Perform(async (api, stamp) => {
+        Wire r;
+        try { r = await api.Request("/admin/network", "PUT", Wires.O("publicUrl", value)); }
+        catch (JosiException e) {
+          // 409: the installed Windows server may only read its settings. The
+          // server has checked the address; on this PC the app writes it with
+          // Windows administrator approval and restarts Josi.
+          if (e.Status != 409 || !await Task.Run(() => LocalServer.IsThisPc(api.Origin))) throw;
+          var origin = new Uri(value.TrimEnd('/')).GetLeftPart(UriPartial.Authority);
+          await LocalServer.SetAddress(origin);
+          if (Current(stamp)) { urlLoaded = false; note = "Saved. Josi restarted and now uses " + origin + "."; }
+          return;
+        }
+        if (Current(stamp)) { urlLoaded = false; note = r["note"].Text; }
+      });
+    }
+    UIElement ChangeAddress() {
+      Ui.Detach(publicUrl);
+      var items = new List<UIElement> {
+        Ui.Caption("https://name-or-ip:port for your network (Josi issues the certificate), https://name.ts.net:port for Tailscale, http://localhost:port for this PC only, or https://your.domain for a public address served through a tunnel or reverse proxy."),
+        Ui.Field("Public address", publicUrl) };
+      var save = Ui.Pill("Save Address", () => SaveAddress(publicUrl.Text.Trim()), true);
+      save.IsEnabled = !network.IsNull && network["editable"].Flag;
+      items.Add(save);
+      if (!network.IsNull && !network["editable"].Flag) items.Add(Ui.Caption("This server takes its address from where it is started, not from a settings file."));
+      if (note.Length > 0) items.Add(Ui.Secondary(note));
+      return Ui.CardBox("Change the public address", items.ToArray());
+    }
+    protected override UIElement Build() {
+      var page = Page(Ui.HeadingWith("Network and Address", "Where this server answers, and how other devices reach it.", Ui.Pill("Refresh", StartLoad)));
+      Ui.Add(page, Addresses(), 0);
+      var tailscale = Tailscale();
+      if (tailscale != null) Ui.Add(page, tailscale, 0);
+      Ui.Add(page, ChangeAddress(), 0);
+      Ui.Detach(password);
+      var items = new List<UIElement> { Ui.Secondary("Josi briefly opens a separate local controller because this connection is unavailable while the address changes. The controller previews the change, verifies health at the new address, and restores the previous configuration if it fails."),
+        Ui.Field("Administrator password (used once to re-confirm; never saved)", password),
+        Ui.Pill("Open Protected Maintenance", () => {
+          if (password.Password.Length == 0) { model.Error = "Enter your current Josi administrator password."; model.Notify(); return; }
+          var body = Wires.O("password", password.Password, "host", model.Api == null ? "localhost" : model.Api.Origin.Host); password.Clear();
+          Perform(async (api, stamp) => {
+            launch = await api.Request("/admin/maintenance/network/launch", "POST", body);
+            Uri url; if (Uri.TryCreate(launch["url"].Text, UriKind.Absolute, out url) && (url.Scheme == "http" || url.Scheme == "https")) ModelText.Open(url);
+          }, false);
+        }, true) };
+      if (!launch.IsNull) {
+        items.Add(Ui.Secondary("Protected maintenance is ready in your browser. If it did not open, use this address:"));
+        items.Add(Ui.Copyable(launch["url"].Text, 13, null, true));
+        items.Add(Ui.T("Setup code: " + launch["code"].Text, 18, FontWeights.SemiBold));
+        items.Add(Ui.Caption("The code works once and expires with the maintenance session."));
+      }
+      Ui.Add(page, new Disclosure("Advanced: protected maintenance (ports, reverse proxy, certificates)", () => Ui.CardBox(null, items.ToArray()), !launch.IsNull), 0);
+      return page;
+    }
+  }
+}

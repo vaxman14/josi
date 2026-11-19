@@ -1,0 +1,549 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Reflection;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Input;
+using System.Windows.Markup;
+using System.Windows.Media;
+using System.Windows.Media.Animation;
+using System.Windows.Media.Imaging;
+using System.Windows.Threading;
+
+namespace Josi.Native {
+  /// Small builders over the shared theme so every screen matches the Mac app:
+  /// navy surfaces, cream text, orange accents, rounded cards and pill buttons.
+  public static class Ui {
+    public static ResourceDictionary Resources;
+    public static Brush Background, Sidebar, Card, Raised, Border, Accent, Text, Muted, AccentSoft, AccentFaint, Green, Warning;
+    public static Brush Error, OnGold, GoldGradient, Backdrop, Frost, Hairline, Sheet, Scrim, SendFill;
+    public static FontFamily Font, Display, Icons, Mono;
+    static BitmapImage mark;
+
+    public static void Load() {
+      RoutePaste();
+      using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("Theme.xaml"))
+      using (var reader = new System.IO.StreamReader(stream))
+        Resources = (ResourceDictionary)XamlReader.Parse(Skin.Apply(reader.ReadToEnd()));
+      Background = (Brush)Resources["Background"]; Sidebar = (Brush)Resources["Sidebar"]; Card = (Brush)Resources["Card"];
+      Raised = (Brush)Resources["Raised"]; Border = (Brush)Resources["BorderBrush"]; Accent = (Brush)Resources["Accent"];
+      Text = (Brush)Resources["Text"]; Muted = (Brush)Resources["Muted"]; AccentSoft = (Brush)Resources["AccentSoft"];
+      AccentFaint = (Brush)Resources["AccentFaint"];
+      var skin = Skin.Current;
+      Green = Skin.Solid(skin.Success); Error = Skin.Solid(skin.Error); OnGold = Skin.Solid(skin.OnGold);
+      Warning = Accent;
+      GoldGradient = Skin.GoldGradient(); Backdrop = Skin.Backdrop();
+      Frost = Skin.Solid(skin.Panel, 0xB8); Hairline = Skin.Solid(skin.Gold2, 0x40);
+      Sheet = Skin.Solid(skin.Deep); Scrim = Skin.Solid(skin.Bottom, 0xA6); SendFill = Skin.SendFill();
+      Font = (FontFamily)Resources["Font"]; Icons = (FontFamily)Resources["Icons"]; Mono = (FontFamily)Resources["Mono"];
+      Display = new FontFamily("pack://application:,,,/Josi;component/assets/fonts/#Bricolage Grotesque, Segoe UI");
+    }
+
+    public static BitmapImage Mark {
+      get {
+        if (mark == null) {
+          mark = new BitmapImage();
+          mark.BeginInit();
+          mark.StreamSource = Assembly.GetExecutingAssembly().GetManifestResourceStream("josi-mark.png");
+          mark.CacheOption = BitmapCacheOption.OnLoad;
+          mark.DecodePixelWidth = 256;
+          mark.EndInit(); mark.Freeze();
+        }
+        return mark;
+      }
+    }
+
+    /// White J on navy, from the approved master asset.
+    public static FrameworkElement JosiMark(double size) {
+      // The gold J on its tile, as JosiMarkTile draws it on the Mac.
+      var glyph = new System.Windows.Shapes.Rectangle { Width = size * 0.6, Height = size * 0.6, Fill = GoldGradient,
+        OpacityMask = new ImageBrush(Mark) { Stretch = Stretch.Uniform } };
+      var tile = new Border { Width = size, Height = size, CornerRadius = new CornerRadius(size * 0.27), Child = glyph,
+        BorderBrush = Hairline, BorderThickness = new Thickness(1),
+        Background = new LinearGradientBrush(Skin.Hex(Skin.Current.TileTop), Skin.Hex(Skin.Current.Panel), 90) };
+      AutomationHidden(tile);
+      return tile;
+    }
+    static void AutomationHidden(UIElement element) {
+      // Decorative: no name, no focus, no hit testing, so screen readers skip it.
+      element.Focusable = false;
+    }
+
+    public static TextBlock T(string text, double size = 14, FontWeight? weight = null, Brush brush = null) {
+      return new TextBlock {
+        Text = text ?? "", FontSize = size, FontFamily = size >= 17 && weight >= FontWeights.SemiBold ? Display : Font, FontWeight = weight ?? FontWeights.Normal,
+        Foreground = brush ?? Text, TextWrapping = TextWrapping.Wrap
+      };
+    }
+    public static TextBlock Caption(string text) { return T(text, 12, null, Muted); }
+    public static TextBlock Secondary(string text) { return T(text, 14, null, Muted); }
+    public static TextBlock Headline(string text) { return T(text, 15, FontWeights.SemiBold); }
+    public static TextBlock Title2(string text) { return T(text, 21, FontWeights.Bold); }
+    static ControlTemplate plainText;
+    static ControlTemplate PlainTextTemplate() {
+      if (plainText == null) {
+        plainText = (ControlTemplate)XamlReader.Parse("<ControlTemplate xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' TargetType='TextBox'><ScrollViewer x:Name='PART_ContentHost' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' Focusable='False' HorizontalScrollBarVisibility='Disabled' VerticalScrollBarVisibility='Disabled'/></ControlTemplate>");
+      }
+      return plainText;
+    }
+    public static TextBox Copyable(string text, double size = 14, Brush brush = null, bool mono = false) {
+      return new TextBox {
+        Text = text ?? "", IsReadOnly = true, TextWrapping = TextWrapping.Wrap, Background = Brushes.Transparent,
+        BorderThickness = new Thickness(0), Padding = new Thickness(0), FontSize = size, Foreground = brush ?? Text,
+        FontFamily = mono ? Mono : Font, Template = PlainTextTemplate()
+      };
+    }
+
+    public static TextBlock Icon(string glyph, double size = 16, Brush brush = null) {
+      var icon = new TextBlock { Text = glyph, FontFamily = Icons, FontSize = size, Foreground = brush, VerticalAlignment = VerticalAlignment.Center };
+      if (brush == null) icon.ClearValue(TextBlock.ForegroundProperty);
+      AutomationHidden(icon);
+      return icon;
+    }
+
+    /// Vertical rhythm of a section page: the gap between its top-level blocks.
+    public const double PageSpacing = 18;
+    public static readonly object PageSpacingTag = "page";
+    /// The content column every section shares: one left edge, one width.
+    public const double PageWidth = 1040;
+    public static StackPanel Stack(double spacing, params UIElement[] children) {
+      var panel = new StackPanel();
+      foreach (var child in children) Add(panel, child, spacing);
+      return panel;
+    }
+    static readonly System.Runtime.CompilerServices.ConditionalWeakTable<FrameworkElement, object> baseMargins =
+      new System.Runtime.CompilerServices.ConditionalWeakTable<FrameworkElement, object>();
+    /// Controls that keep typed text live across renders are reattached here,
+    /// so remove them from their previous parent and reuse their own margin.
+    public static void Detach(FrameworkElement element) {
+      var panel = element.Parent as Panel;
+      if (panel != null) { panel.Children.Remove(element); return; }
+      var decorator = element.Parent as Decorator;
+      if (decorator != null) { decorator.Child = null; return; }
+      var content = element.Parent as ContentControl;
+      if (content != null) content.Content = null;
+    }
+    public static void Add(Panel panel, UIElement child, double spacing) {
+      if (child == null) return;
+      var element = child as FrameworkElement;
+      if (element != null) {
+        if (element.Parent != null) Detach(element);
+        object original;
+        if (baseMargins.TryGetValue(element, out original)) element.Margin = (Thickness)original;
+        else baseMargins.Add(element, element.Margin);
+      }
+      if (element != null && panel.Children.Count > 0) {
+        // A section page keeps one rhythm between its blocks whatever each
+        // call passed, so headings, cards and lists never touch.
+        if (PageSpacingTag.Equals(panel.Tag) && spacing < PageSpacing) spacing = PageSpacing;
+        var margin = element.Margin;
+        var horizontal = panel is StackPanel && ((StackPanel)panel).Orientation == Orientation.Horizontal;
+        element.Margin = horizontal ? new Thickness(margin.Left + spacing, margin.Top, margin.Right, margin.Bottom)
+                                    : new Thickness(margin.Left, margin.Top + spacing, margin.Right, margin.Bottom);
+      }
+      panel.Children.Add(child);
+    }
+    public static StackPanel Row(double spacing, params UIElement[] children) {
+      var panel = new StackPanel { Orientation = Orientation.Horizontal };
+      foreach (var child in children) {
+        var element = child as FrameworkElement;
+        if (element != null) element.VerticalAlignment = VerticalAlignment.Center;
+        Add(panel, child, spacing);
+      }
+      return panel;
+    }
+    public static WrapPanel Wrap(params UIElement[] children) {
+      var panel = new WrapPanel();
+      foreach (var child in children) {
+        if (child == null) continue;
+        var element = child as FrameworkElement;
+        if (element != null) { if (element.Parent != null) Detach(element); element.Margin = new Thickness(0, 0, 8, 8); }
+        panel.Children.Add(child);
+      }
+      return panel;
+    }
+    /// Left content, flexible space, right content.
+    public static Grid Spread(UIElement left, UIElement right) {
+      var grid = new Grid();
+      grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+      grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+      foreach (var part in new[] { left, right }) { var e = part as FrameworkElement; if (e != null && e.Parent != null) Detach(e); }
+      if (left != null) { Grid.SetColumn(left, 0); grid.Children.Add(left); }
+      if (right != null) {
+        Grid.SetColumn(right, 1); grid.Children.Add(right);
+        var element = right as FrameworkElement;
+        if (element != null) { element.VerticalAlignment = VerticalAlignment.Center; element.Margin = new Thickness(12, 0, 0, 0); }
+      }
+      return grid;
+    }
+
+    /// JosiGroupBoxStyle: card with optional headline.
+    public static Border CardBox(string title, params UIElement[] content) {
+      var stack = new StackPanel();
+      if (!string.IsNullOrEmpty(title)) Add(stack, Headline(title), 0);
+      foreach (var child in content) Add(stack, child, 12);
+      return new Border {
+        Background = Card, BorderBrush = Hairline, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(14),
+        Padding = new Thickness(18), Child = stack, HorizontalAlignment = HorizontalAlignment.Stretch
+      };
+    }
+
+    public static FrameworkElement Heading(string title, string subtitle) {
+      return Stack(6, T(title, 30, FontWeights.Bold), subtitle == null ? null : Secondary(subtitle));
+    }
+    /// Title with an action on the right, kept level with the title even when
+    /// the subtitle wraps to several lines.
+    public static FrameworkElement HeadingWith(string title, string subtitle, UIElement right) {
+      var grid = Spread(Heading(title, subtitle), right);
+      var element = right as FrameworkElement;
+      if (element != null) { element.VerticalAlignment = VerticalAlignment.Top; element.Margin = new Thickness(16, 4, 0, 0); }
+      return grid;
+    }
+
+    // Every control these helpers build gets an automation id derived from its
+    // label within the current screen (Automation.Derive); a screen gives the
+    // important ones a hand-chosen id afterwards. See AUTOMATION.md.
+    public static Button Pill(string text, Action click, bool prominent = false) {
+      var button = new Button { Content = text, Style = (Style)Resources[prominent ? "PillProminent" : "Pill"] };
+      Automation.Derive(button, "button", text);
+      if (click != null) button.Click += delegate { click(); };
+      return button;
+    }
+    public static Button Danger(string text, Action click) {
+      var button = new Button { Content = text, Style = (Style)Resources["PillDanger"] };
+      Automation.Derive(button, "button", text);
+      if (click != null) button.Click += delegate { click(); };
+      return button;
+    }
+    public static Button PillIcon(string glyph, string label, Action click, bool prominent = false, string tip = null) {
+      var content = new StackPanel { Orientation = Orientation.Horizontal };
+      content.Children.Add(Icon(glyph, 14));
+      if (!string.IsNullOrEmpty(label)) {
+        var text = T(label, 13.5, FontWeights.Medium); text.Margin = new Thickness(7, 0, 0, 0); text.Foreground = null;
+        text.ClearValue(TextBlock.ForegroundProperty);
+        content.Children.Add(text);
+      }
+      var button = new Button { Content = content, Style = (Style)Resources[prominent ? "PillProminent" : "Pill"] };
+      Name(button, label ?? tip, tip);
+      Automation.Derive(button, "button", label ?? tip);
+      if (click != null) button.Click += delegate { click(); };
+      return button;
+    }
+    /// A round icon button; `fill` replaces the panel colour, as on send.
+    public static Button RoundButton(string glyph, string label, Action click, double size = 44, Brush icon = null, Brush fill = null) {
+      var button = new Button { Content = Icon(glyph, size * 0.4, icon ?? Accent), Style = (Style)Resources["Round"], Width = size, Height = size };
+      if (fill != null) { button.Background = fill; button.BorderBrush = Brushes.Transparent; }
+      Name(button, label, label);
+      Automation.Derive(button, "button", label);
+      if (click != null) button.Click += delegate { click(); };
+      return button;
+    }
+    public static Button IconButton(string glyph, string label, Action click, double size = 16) {
+      var button = new Button { Content = Icon(glyph, size), Style = (Style)Resources["Plain"], Padding = new Thickness(6) };
+      Name(button, label, label);
+      Automation.Derive(button, "button", label);
+      if (click != null) button.Click += delegate { click(); };
+      return button;
+    }
+    public static Button Link(string text, Action click) {
+      var button = new Button { Content = text, Style = (Style)Resources["LinkButton"] };
+      Automation.Derive(button, "link", text);
+      if (click != null) button.Click += delegate { click(); };
+      return button;
+    }
+    public static void Name(FrameworkElement element, string name, string tip) {
+      if (!string.IsNullOrEmpty(name)) System.Windows.Automation.AutomationProperties.SetName(element, name);
+      if (!string.IsNullOrEmpty(tip)) element.ToolTip = tip;
+    }
+
+    public static TextBox Input(string placeholder = null, string value = "", bool multiline = false) {
+      var box = new TextBox { Text = value ?? "" };
+      if (multiline) { box.AcceptsReturn = true; box.TextWrapping = TextWrapping.Wrap; box.MinHeight = 64; box.VerticalScrollBarVisibility = ScrollBarVisibility.Auto; }
+      if (!string.IsNullOrEmpty(placeholder)) { Placeholder(box, placeholder); Automation.Derive(box, "input", placeholder); }
+      return box;
+    }
+    /// A box that reads as a box on the dark sheet background: taller, lighter
+    /// edge. The theme's raised fill alone was invisible against a sheet.
+    public static T Visible<T>(T box) where T : Control { box.MinHeight = 40; box.BorderBrush = Muted; box.Background = Card; return box; }
+    /// The clipboard's text, or null. Another program can hold the clipboard
+    /// for a moment, so this tries a few times.
+    public static string ClipboardText() {
+      for (var attempt = 0; attempt < 4; attempt++) {
+        try { return Clipboard.ContainsText() ? Clipboard.GetText() : null; }
+        catch (Exception) { System.Threading.Thread.Sleep(60); }
+      }
+      return null;
+    }
+    /// Paste in every text and password box reads the clipboard directly.
+    /// The text editor's own Paste did nothing on this PC (Ctrl+V and the
+    /// right-click menu alike) while a direct read worked, so the command is
+    /// answered here, ahead of the editor's handler.
+    static void RoutePaste() {
+      CommandManager.RegisterClassCommandBinding(typeof(TextBox), new CommandBinding(ApplicationCommands.Paste,
+        (s, e) => { var box = (TextBox)s; e.Handled = true; if (box.IsReadOnly) return; var text = ClipboardText(); if (string.IsNullOrEmpty(text)) return;
+          if (!box.AcceptsReturn) text = text.Replace("\r\n", " ").Replace('\n', ' ').Replace('\r', ' ').Trim();
+          var at = box.SelectionStart; box.SelectedText = text; box.SelectionLength = 0; box.CaretIndex = at + text.Length; },
+        (s, e) => { e.CanExecute = !((TextBox)s).IsReadOnly; e.Handled = true; }));
+      CommandManager.RegisterClassCommandBinding(typeof(PasswordBox), new CommandBinding(ApplicationCommands.Paste,
+        (s, e) => { e.Handled = true; var text = ClipboardText(); if (string.IsNullOrWhiteSpace(text)) return; ((PasswordBox)s).Password = text.Trim(); },
+        (s, e) => { e.CanExecute = true; e.Handled = true; }));
+    }
+    /// A plain box with a Paste button, laid out like a secret row so the
+    /// boxes on a card line up (the Show column stays empty).
+    public static Grid PasteRow(TextBox box, string label) {
+      var row = new Grid();
+      row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+      row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto, SharedSizeGroup = "paste" }); row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto, SharedSizeGroup = "show" });
+      var paste = Pill("Paste", () => { var text = ClipboardText(); if (string.IsNullOrWhiteSpace(text)) return; box.Text = text.Trim(); box.Focus(); box.CaretIndex = box.Text.Length; });
+      Automation.Derive(paste, "paste", label + " paste"); paste.Margin = new Thickness(8, 0, 0, 0);
+      Grid.SetColumn(box, 0); Grid.SetColumn(paste, 1); row.Children.Add(box); row.Children.Add(paste);
+      return row;
+    }
+    /// A secret the person types or pastes: stars by default, Paste from the
+    /// clipboard, Show to check it. Reading the value is explicit (`Value`).
+    public sealed class SecretEntry : Grid {
+      public readonly PasswordBox Hidden; public readonly TextBox Shown; readonly Button toggle; bool showing;
+      public SecretEntry(string label) {
+        Hidden = Visible(Secret(label)); Shown = Visible(Input(label)); Shown.Visibility = Visibility.Collapsed;
+        ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto, SharedSizeGroup = "paste" }); ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto, SharedSizeGroup = "show" });
+        var paste = Pill("Paste", () => { var text = ClipboardText(); if (string.IsNullOrWhiteSpace(text)) return; text = text.Trim(); if (showing) Shown.Text = text; else Hidden.Password = text; Focus(); });
+        Automation.Derive(paste, "paste", label + " paste");
+        toggle = Pill("Show", () => Toggle()); Automation.Derive(toggle, "show", label + " show");
+        paste.Margin = new Thickness(8, 0, 0, 0); toggle.Margin = new Thickness(8, 0, 0, 0);
+        SetColumn(Hidden, 0); SetColumn(Shown, 0); SetColumn(paste, 1); SetColumn(toggle, 2);
+        Children.Add(Hidden); Children.Add(Shown); Children.Add(paste); Children.Add(toggle);
+      }
+      void Toggle() {
+        if (showing) { Hidden.Password = Shown.Text; Shown.Text = ""; Shown.Visibility = Visibility.Collapsed; Hidden.Visibility = Visibility.Visible; toggle.Content = "Show"; }
+        else { Shown.Text = Hidden.Password; Hidden.Clear(); Hidden.Visibility = Visibility.Collapsed; Shown.Visibility = Visibility.Visible; toggle.Content = "Hide"; }
+        showing = !showing; Focus();
+      }
+      public string Value { get { return showing ? Shown.Text : Hidden.Password; } }
+      public void Clear() { Hidden.Clear(); Shown.Text = ""; }
+      public new void Focus() { if (showing) { Shown.Focus(); Shown.CaretIndex = Shown.Text.Length; } else Hidden.Focus(); }
+    }
+    public static SecretEntry SecretField(string label) { return new SecretEntry(label); }
+    public static PasswordBox Secret(string placeholder = null) {
+      var box = new PasswordBox();
+      if (!string.IsNullOrEmpty(placeholder)) { System.Windows.Automation.AutomationProperties.SetName(box, placeholder); Automation.Derive(box, "secret", placeholder); }
+      return box;
+    }
+    /// Label above a control, as the Mac setup forms present fields.
+    public static FrameworkElement Field(string label, Control control) {
+      System.Windows.Automation.AutomationProperties.SetName(control, label);
+      if (Automation.Unnamed(control)) Automation.Derive(control, "field", label);
+      return Stack(5, T(label, 13.5), control);
+    }
+    public static void Placeholder(TextBox box, string text, Brush fill = null) {
+      System.Windows.Automation.AutomationProperties.SetName(box, text);
+      var surface = fill ?? Raised;
+      Action update = () => {
+        var size = box.FontSize;
+        if (box.Text.Length == 0) {
+          // The hint starts where typed text starts: border, padding, then the
+          // text view's own 2-pixel inset. A drawing anchored at the box's
+          // corner keeps that offset; a brush visual would lose its margin.
+          var hint = new FormattedText(text, System.Globalization.CultureInfo.CurrentUICulture, FlowDirection.LeftToRight,
+            new Typeface(Font, FontStyles.Normal, FontWeights.Normal, FontStretches.Normal), size, Muted,
+            VisualTreeHelper.GetDpi(box).PixelsPerDip);
+          var drawing = new DrawingGroup();
+          drawing.Children.Add(new GeometryDrawing(surface, null, new RectangleGeometry(new Rect(0, 0, 4000, 400))));
+          drawing.Children.Add(new GeometryDrawing(Muted, null, hint.BuildGeometry(
+            new Point(box.BorderThickness.Left + box.Padding.Left + 2, box.BorderThickness.Top + box.Padding.Top))));
+          box.Background = new DrawingBrush(drawing) { Stretch = Stretch.None, AlignmentX = AlignmentX.Left, AlignmentY = AlignmentY.Top };
+        }
+        else box.Background = surface;
+      };
+      box.TextChanged += delegate { update(); };
+      // Padding and font size come from the theme once the box is on screen.
+      box.Loaded += delegate { update(); };
+      update();
+    }
+    public static CheckBox Toggle(string text, bool value = false) {
+      var box = new CheckBox { Content = text, IsChecked = value };
+      Automation.Derive(box, "toggle", text);
+      return box;
+    }
+    public static ComboBox Choice(IList<KeyValuePair<string, string>> options, string selected) {
+      var combo = new ComboBox();
+      foreach (var option in options) {
+        var item = new ComboBoxItem { Content = option.Value, Tag = option.Key };
+        combo.Items.Add(item);
+        if (option.Key == selected) combo.SelectedItem = item;
+      }
+      return combo;
+    }
+    public static string Selected(ComboBox combo) {
+      var item = combo.SelectedItem as ComboBoxItem;
+      return item == null ? "" : (string)item.Tag;
+    }
+    public static List<KeyValuePair<string, string>> Options(params string[] pairs) {
+      var list = new List<KeyValuePair<string, string>>();
+      for (var i = 0; i + 1 < pairs.Length; i += 2) list.Add(new KeyValuePair<string, string>(pairs[i], pairs[i + 1]));
+      return list;
+    }
+
+    /// Segmented control, as Picker(.segmented) and the Task Manager filters.
+    /// idPrefix, when given, makes each segment's id fixed: idPrefix + key (AUTOMATION.md).
+    /// A choice among many: each label keeps its own width on one line, and
+    /// the labels wrap as a row when the page is narrow.
+    public static WrapPanel Chips(IList<KeyValuePair<string, string>> options, string selected, Action<string> pick, string idPrefix = null) {
+      var panel = new WrapPanel();
+      foreach (var option in options) {
+        var key = option.Key;
+        var on = key == selected;
+        var label = T(option.Value, 13.5, FontWeights.Medium, on ? Accent : Muted);
+        label.TextWrapping = TextWrapping.NoWrap;
+        var button = new Button { Content = label, Style = (Style)Resources["Plain"], Padding = new Thickness(14, 8, 14, 8),
+          Background = on ? (Brush)Resources["AccentSoft"] : Card, Margin = new Thickness(0, 0, 6, 6) };
+        if (idPrefix != null) Automation.Id(button, idPrefix + key, option.Value);
+        else Automation.Derive(button, "segment", "segment " + key);
+        System.Windows.Automation.AutomationProperties.SetItemStatus(button, on ? "selected" : "");
+        button.Click += delegate { pick(key); };
+        panel.Children.Add(button);
+      }
+      return panel;
+    }
+    /// A label in a fixed column with its value right beside it.
+    public static Grid Fact(string label, UIElement value, double labelWidth = 170) {
+      var grid = new Grid();
+      grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(labelWidth) });
+      grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+      var name = T(label, 13, null, Muted); name.VerticalAlignment = VerticalAlignment.Center; name.Margin = new Thickness(0, 0, 12, 0);
+      grid.Children.Add(name);
+      if (value != null) {
+        var element = value as FrameworkElement;
+        if (element != null) { if (element.Parent != null) Detach(element); element.VerticalAlignment = VerticalAlignment.Center; element.HorizontalAlignment = HorizontalAlignment.Left; }
+        Grid.SetColumn(value, 1); grid.Children.Add(value);
+      }
+      return grid;
+    }
+    public static Border Segments(IList<KeyValuePair<string, string>> options, string selected, Action<string> pick, string idPrefix = null) {
+      var grid = new UniformGrid { Rows = 1 };
+      foreach (var option in options) {
+        var key = option.Key;
+        var on = key == selected;
+        var label = T(option.Value, 13.5, FontWeights.Medium, on ? Accent : Muted);
+        label.TextAlignment = TextAlignment.Center; label.HorizontalAlignment = HorizontalAlignment.Center;
+        var button = new Button { Content = label, Style = (Style)Resources["Plain"], Padding = new Thickness(12, 9, 12, 9),
+          Background = on ? (Brush)Resources["AccentSoft"] : Brushes.Transparent, Margin = new Thickness(2) };
+        if (idPrefix != null) Automation.Id(button, idPrefix + key, option.Value);
+        else Automation.Derive(button, "segment", "segment " + key);
+        System.Windows.Automation.AutomationProperties.SetItemStatus(button, on ? "selected" : "");
+        button.Click += delegate { pick(key); };
+        grid.Children.Add(button);
+      }
+      return new Border { Background = Frost, CornerRadius = new CornerRadius(11),
+        Padding = new Thickness(3), Child = grid, MaxWidth = 620, HorizontalAlignment = HorizontalAlignment.Left };
+    }
+
+    public static Separator Divider() {
+      return new Separator { Background = Border, Margin = new Thickness(0, 4, 0, 4) };
+    }
+    public static ScrollViewer Scroll(UIElement content, double maxWidth = double.PositiveInfinity, double padding = 30) {
+      var element = content as FrameworkElement;
+      // One left edge for every section, so moving between tabs does not shift
+      // the content column; wide pages (calendar, chat) still stretch.
+      if (element != null) { element.Margin = new Thickness(padding + 6, padding, padding, padding); element.MaxWidth = maxWidth; element.HorizontalAlignment = double.IsInfinity(maxWidth) ? HorizontalAlignment.Stretch : HorizontalAlignment.Left; }
+      return new ScrollViewer { Content = content, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled, Focusable = false };
+    }
+
+    public static FrameworkElement StatusBadge(string state) {
+      var labels = new Dictionary<string, string> {
+        {"planning", "Planning"}, {"working", "In progress"}, {"needs_instruction", "Needs attention"}, {"waiting", "Waiting"},
+        {"paused", "Paused"}, {"verifying", "Ready to review"}, {"completed", "Complete"}, {"cancelled", "Cancelled"}
+      };
+      string text;
+      if (!labels.TryGetValue(state, out text)) text = Wires.Capitalize(state);
+      var color = state == "completed" ? Green : Accent;
+      var row = Row(6, new System.Windows.Shapes.Ellipse { Width = 7, Height = 7, Fill = color }, T(text, 12, FontWeights.SemiBold, color));
+      return new Border { Background = AccentFaint, CornerRadius = new CornerRadius(12), Padding = new Thickness(10, 5, 10, 5), Child = row, VerticalAlignment = VerticalAlignment.Center };
+    }
+
+    /// The J mark, gently rocking and bobbing; still when Windows animations are off.
+    public static FrameworkElement AnimatedMark(double size) {
+      var markElement = JosiMark(size);
+      var rotate = new RotateTransform(0, size / 2, size / 2);
+      var move = new TranslateTransform();
+      var group = new TransformGroup(); group.Children.Add(rotate); group.Children.Add(move);
+      markElement.RenderTransform = group;
+      if (SystemParameters.ClientAreaAnimation) {
+        var ease = new SineEase { EasingMode = EasingMode.EaseInOut };
+        var lift = Math.Max(2, size / 9.5);
+        var spin = new DoubleAnimation(-9, 9, TimeSpan.FromSeconds(0.52)) { AutoReverse = true, RepeatBehavior = RepeatBehavior.Forever, EasingFunction = ease };
+        var bob = new DoubleAnimation(lift / 2, -lift, TimeSpan.FromSeconds(0.52)) { AutoReverse = true, RepeatBehavior = RepeatBehavior.Forever, EasingFunction = ease };
+        rotate.BeginAnimation(RotateTransform.AngleProperty, spin);
+        move.BeginAnimation(TranslateTransform.YProperty, bob);
+      }
+      return markElement;
+    }
+    /// The capsule beside the ghost while Josi is working on a reply.
+    public static FrameworkElement Thinking(string activity, out TextBlock label) {
+      var text = string.IsNullOrEmpty(activity) ? "Josi is thinking" : activity;
+      label = T(text, 12.5, null, Accent);
+      var pill = new Border { Background = AccentFaint, BorderBrush = Hairline, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(14),
+        Padding = new Thickness(12, 6, 12, 6), Child = Automation.Id(label, "josi.chat.thinking.text") };
+      // A panel has no automation peer; the group makes the indicator findable.
+      var group = Automation.Group("josi.chat.thinking", "Josi is thinking", pill);
+      group.VerticalAlignment = VerticalAlignment.Center;
+      return group;
+    }
+    /// A small animated J with a sentence, for any wait: "Checking…",
+    /// "Waiting for your approval…". With `elapsed`, a seconds counter shows
+    /// the wait is alive rather than stuck.
+    public static WorkingIndicator Working(string text, bool elapsed = false, double size = 22) {
+      var indicator = new WorkingIndicator(text, elapsed, size);
+      Automation.Derive(indicator, "working", "working");
+      return indicator;
+    }
+
+    public static bool Confirm(Window owner, string title, string detail, string action) {
+      return Dialogs.Confirm(owner, title, detail, action);
+    }
+  }
+
+  public sealed class WorkingIndicator : UserControl {
+    readonly TextBlock label, clock;
+    readonly DispatcherTimer timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+    readonly DateTime started = DateTime.UtcNow;
+    public WorkingIndicator(string text, bool elapsed, double size) {
+      label = Ui.T(text, 13.5, null, Ui.Muted);
+      clock = Ui.T("", 12, null, Ui.Muted);
+      clock.VerticalAlignment = VerticalAlignment.Center;
+      Focusable = false;
+      Content = Ui.Row(10, Ui.AnimatedMark(size), label, elapsed ? clock : null);
+      System.Windows.Automation.AutomationProperties.SetName(this, text);
+      if (elapsed) {
+        timer.Tick += delegate { Tick(); };
+        Loaded += delegate { Tick(); timer.Start(); };
+        Unloaded += delegate { timer.Stop(); };
+      }
+    }
+    void Tick() {
+      var seconds = (int)(DateTime.UtcNow - started).TotalSeconds;
+      clock.Text = seconds < 60 ? seconds + " s" : (seconds / 60) + " min " + (seconds % 60) + " s";
+    }
+    public string Text {
+      get { return label.Text; }
+      set { label.Text = value; System.Windows.Automation.AutomationProperties.SetName(this, value); }
+    }
+  }
+
+  /// Segoe Fluent Icons / MDL2 glyphs standing in for the Mac's SF Symbols.
+  public static class Glyph {
+    public const string Chat = "", Checklist = "", Memory = "", Automation = "", Vault = "",
+      Person = "", Send = "", Layers = "", People = "", Mail = "", Backups = "",
+      Server = "", Compose = "", SignOut = "", Warning = "", Close = "", Plus = "",
+      Chevron = "", Mic = "", Stop = "", Up = "", Copy = "", Speaker = "", Clip = "",
+      Wave = "", Check = "", Circle = "", Minus = "", Desktop = "", Network = "", Bubble = "",
+      Pause = "", Play = "", Refresh = "",
+      // Segoe Fluent Icons for the sections added with the full build list.
+      Calendar = "\uE787", Contact = "\uE77B", Folder = "\uE8B7", Clock = "\uE823", Link = "\uE71B", Shield = "\uE83D",
+      Approve = "\uE8FB", Emoji = "\uE76E", Flow = "\uE9D5", Chart = "\uE9D9", Settings = "\uE713", Globe = "\uE774",
+      History = "\uE81C", Menu = "\uE700", Code = "\uE943", Plug = "\uE703", Import = "\uE8B5", Document = "\uE8A5", Health = "\uE95E",
+      Repair = "\uE90F", List = "\uE8FD", Phone = "\uE8EA", Home = "\uE80F";
+  }
+}

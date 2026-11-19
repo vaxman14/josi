@@ -1,0 +1,11 @@
+# syntax=docker/dockerfile:1.7
+# A new Josi package on top of a published all-in-one image: the way v6-b37 was made (2026-11-18).
+# Edit the base tag, the .deb name and the label, or see build-update.sh. The model layer is not rebuilt.
+# Built on the published v6-b36 image: its model layer, operating system layer and scripts are reused byte for byte,
+# so only this one new layer has to be pushed and pulled. The Josi package replaces the old one with dpkg.
+FROM romanvaxman/josi-allinone:v6-b36
+RUN --mount=type=bind,source=josi_1.2.8-beta.37_amd64.deb,target=/pkg/josi.deb \
+    apt-get update && apt-get install -y --no-install-recommends /pkg/josi.deb \
+    && rm -rf /var/lib/apt/lists/* \
+    && find /usr/lib/josi/runtime -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
+LABEL org.opencontainers.image.version="1.2.8-beta.37" org.opencontainers.image.base.name="romanvaxman/josi-allinone:v6-b36"
